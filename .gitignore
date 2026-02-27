@@ -1,1 +1,31 @@
+# Reports
+trustline_report_*
 aws_account_analysis*
+
+# Trusted accounts (may contain org-specific data)
+trusted_accounts.yaml
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db

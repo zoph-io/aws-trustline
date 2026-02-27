@@ -1,47 +1,115 @@
-# Know Your Enemies - AWS Account Analysis Tool
+# AWS Trustline
 
-This tool analyzes IAM Role trust policies and S3 bucket policies in your AWS account to identify third-party vendors with access to your resources. It compares the AWS account IDs found in these policies against a reference list of [known AWS accounts from fwd:cloudsec](https://github.com/fwdcloudsec/known_aws_accounts/) to identify the vendors behind these accounts.
+> Map and audit third-party trust relationships in your AWS account.
+
+AWS Trustline analyzes IAM Role trust policies and S3 bucket policies to identify who has access to your AWS resources. It cross-references AWS account IDs found in these policies against a community-maintained list of [known AWS accounts](https://github.com/fwdcloudsec/known_aws_accounts) from [fwd:cloudsec](https://fwdcloudsec.org/) to automatically identify the vendors behind those accounts.
 
 ## Features
 
-- 🔍 Analyzes IAM Role trust policies to identify who can assume your roles
-- 🔍 Checks S3 bucket policies to identify who has access to your data
-- 📊 Uses reference data from [known AWS accounts](https://github.com/fwdcloudsec/known_aws_accounts) to identify vendors
-- 🔒 Supports defining your own trusted AWS accounts to distinguish between internal and external access
-- 🏷️ Automatically detects and displays AWS account aliases for better readability
-- ⚠️ Identifies IAM roles vulnerable to the confused deputy problem (missing ExternalId condition)
-- 📝 Generates nice-looking console output with tables
-- 📄 Creates a markdown report you can share with your security team
+- **IAM Role Trust Analysis** -- Identifies who can assume roles in your account (trusted internal accounts, known vendors, unknown external accounts)
+- **S3 Bucket Policy Analysis** -- Identifies who has cross-account access to your S3 data
+- **Vendor Identification** -- Matches account IDs against 500+ known AWS vendor accounts
+- **Confused Deputy Detection** -- Flags IAM roles missing the `ExternalId` condition on cross-account trust
+- **AWS Organizations Support** -- Automatically fetches your org accounts as trusted entities
+- **Custom Trusted Accounts** -- Define your own trusted accounts via YAML configuration
+- **Markdown Reports** -- Generates shareable reports for your security team
+- **CLI Flexibility** -- Supports AWS profiles, regions, selective analysis, and custom output paths
+
+## How It Works
+
+```mermaid
+flowchart LR
+    A[fwd:cloudsec\nKnown Accounts] --> D[Trustline]
+    B[AWS Organizations] --> D
+    C[trusted_accounts.yaml] --> D
+    D --> E[IAM Role\nTrust Policies]
+    D --> F[S3 Bucket\nPolicies]
+    E --> G[Analysis &\nReport]
+    F --> G
+```
+
+1. **Gather reference data** -- fetches the latest known AWS vendor accounts from fwd:cloudsec, your AWS Organization members, and any locally defined trusted accounts
+2. **Scan policies** -- reads all IAM role trust policies and S3 bucket policies in the target account
+3. **Classify access** -- categorizes every external account ID as _trusted_, _known vendor_, or _unknown_
+4. **Detect vulnerabilities** -- flags cross-account roles missing the `ExternalId` condition (confused deputy risk)
+5. **Report** -- displays results in the console and writes a markdown report
+
+## Quick Start
+
+```bash
+git clone https://github.com/zoph-io/aws-trustline.git
+cd aws-trustline
+pip install -r requirements.txt
+python trustline.py
+```
 
 ## Installation
 
 1. Clone this repository:
 
-   ```
-   git clone https://github.com/yourusername/know-your-enemies.git
-   cd know-your-enemies
+   ```bash
+   git clone https://github.com/zoph-io/aws-trustline.git
+   cd aws-trustline
    ```
 
-2. Install the required dependencies:
+2. Install dependencies:
 
-   ```
+   ```bash
    pip install -r requirements.txt
    ```
 
-3. Configure your AWS credentials:
-   ```
+3. Configure AWS credentials (if not already done):
+
+   ```bash
    aws configure
    ```
-   or set environment variables:
-   ```
+
+   Or use environment variables:
+
+   ```bash
    export AWS_ACCESS_KEY_ID="your-access-key"
    export AWS_SECRET_ACCESS_KEY="your-secret-key"
    export AWS_DEFAULT_REGION="your-region"
    ```
 
+## Usage
+
+```bash
+# Basic usage (analyzes IAM roles and S3 buckets)
+python trustline.py
+
+# Use a specific AWS profile
+python trustline.py --profile production
+
+# Skip S3 analysis (IAM roles only)
+python trustline.py --skip-s3
+
+# Custom output directory and trusted accounts file
+python trustline.py --output /tmp/reports --trusted-accounts my-accounts.yaml
+
+# Show version
+python trustline.py --version
+
+# Full options
+python trustline.py --help
+```
+
+### CLI Options
+
+| Option | Short | Description |
+|--------|-------|-------------|
+| `--profile` | `-p` | AWS profile name |
+| `--region` | `-r` | AWS region override |
+| `--output` | `-o` | Output directory for reports (default: `.`) |
+| `--trusted-accounts` | `-t` | Path to trusted accounts YAML (default: `trusted_accounts.yaml`) |
+| `--skip-iam` | | Skip IAM role trust policy analysis |
+| `--skip-s3` | | Skip S3 bucket policy analysis |
+| `--verbose` | | Show full error tracebacks |
+| `--version` | `-V` | Print version and exit |
+
 ## Required AWS Permissions
 
-To run this script successfully, your AWS user or role needs the following permissions:
+Your AWS user or role needs the following permissions:
 
 ```json
 {
@@ -49,7 +117,7 @@ To run this script successfully, your AWS user or role needs the following permi
   "Statement": [
     {
       "Effect": "Allow",
-      "Action": ["iam:ListRoles", "iam:GetRole"],
+      "Action": ["iam:ListRoles", "iam:GetRole", "iam:ListAccountAliases"],
       "Resource": "*"
     },
     {
@@ -59,7 +127,7 @@ To run this script successfully, your AWS user or role needs the following permi
     },
     {
       "Effect": "Allow",
-      "Action": ["sts:GetCallerIdentity", "iam:ListAccountAliases"],
+      "Action": ["sts:GetCallerIdentity"],
       "Resource": "*"
     },
     {
@@ -71,25 +139,25 @@ To run this script successfully, your AWS user or role needs the following permi
 }
 ```
 
-You can use the AWS built-in policies:
+Or use existing AWS managed policies:
 
-- `IAMReadOnlyAccess` - For IAM role analysis
-- `AmazonS3ReadOnlyAccess` - For S3 bucket policy analysis
-- `AWSOrganizationsReadOnlyAccess` - For AWS Organizations account listing
+- `IAMReadOnlyAccess` -- IAM role analysis
+- `AmazonS3ReadOnlyAccess` -- S3 bucket policy analysis
+- `AWSOrganizationsReadOnlyAccess` -- Organization account listing
 
-Or create a custom policy with just the permissions listed above for more restricted access.
+The Organizations permission is optional; if unavailable, only the YAML-configured trusted accounts will be used.
 
 ## Trusted Accounts Configuration
 
-You can define your own trusted AWS accounts to distinguish between your internal organization's accounts and external vendors. This helps you focus on identifying truly external access.
+Define your own trusted AWS accounts to distinguish internal accounts from external vendors.
 
-1. Create a `trusted_accounts.yaml` file in the same directory as the script:
+1. Copy the sample file:
 
-   ```
+   ```bash
    cp trusted_accounts.yaml.sample trusted_accounts.yaml
    ```
 
-2. Edit the file to include your organization's AWS accounts:
+2. Edit with your organization's accounts:
 
    ```yaml
    - name: "My Company Production"
@@ -104,106 +172,57 @@ You can define your own trusted AWS accounts to distinguish between your interna
        - "345678901234"
    ```
 
-If the `trusted_accounts.yaml` file doesn't exist or is empty, the script will analyze all accounts as potential external access points.
+If `trusted_accounts.yaml` does not exist, the tool relies solely on AWS Organizations data (if accessible).
 
-## Security Checks Performed
+## Security Checks
 
-### Confused Deputy Problem Detection
+### Confused Deputy Detection
 
-The tool checks if IAM roles with cross-account access are properly protected with an ExternalId condition. The ExternalId condition helps prevent the [confused deputy problem](https://docs.aws.amazon.com/IAM/latest/UserGuide/confused-deputy.html), which occurs when a third-party (the deputy) is tricked into misusing its access to act on behalf of another account.
-
-Roles that allow external accounts to assume them without an ExternalId condition are flagged as vulnerable in the report.
-
-## Usage
-
-Simply run the script:
-
-```
-python check.py
-```
-
-The script will:
-
-1. Fetch the latest reference data of known AWS accounts
-2. Load any trusted accounts from your configuration (if available)
-3. Get the current AWS account alias for better identification
-4. Check all IAM role trust policies in your account
-5. Check all S3 bucket policies in your account
-6. Identify IAM roles vulnerable to the confused deputy problem
-7. Display the results in a nice format in the console
-8. Generate a markdown report file
+The tool checks whether IAM roles with cross-account access include an `ExternalId` condition. The [confused deputy problem](https://docs.aws.amazon.com/IAM/latest/UserGuide/confused-deputy.html) occurs when a third-party service is tricked into misusing its access to act on behalf of another account. Roles that allow external `AssumeRole` without an `ExternalId` condition are flagged as vulnerable.
 
 ## Sample Output
 
 ```
-┌─────────────────────── 🔍 AWS Analysis ───────────────────────┐
-│ Know Your Enemies - AWS Account Analysis Tool                 │
-│ This tool analyzes IAM Role trust policies and S3 bucket      │
-│ policies to identify third-party vendors with access to your  │
-│ resources.                                                    │
-└───────────────────────────────────────────────────────────────┘
+╭──────────────────── AWS Trustline ────────────────────╮
+│ AWS Trustline                                         │
+│ Map and audit third-party trust relationships in your │
+│ AWS account.                                          │
+╰───────────────────────────────────────────────────────╯
 
 Fetching reference data of known AWS accounts...
-✅ Found 480 known AWS accounts in the reference data
+Found 480 known AWS accounts in the reference data
 Loading trusted AWS accounts...
-✅ Loaded 5 trusted AWS accounts
+Found 12 accounts in AWS Organization
 
 Analyzing AWS Account: 123456789012 (my-company-dev)
 
-Checking IAM role trust policies...
-Checking S3 bucket policies...
+╭─ Known Vendors with IAM Role Access ─╮
+│ Vendor   │ IAM Roles                  │
+│──────────┼────────────────────────────│
+│ Datadog  │ DatadogIntegrationRole     │
+╰──────────────────────────────────────╯
 
-┌────────── 🔒 Trusted Entities with IAM Role Access ───────────────┐
-│ Entity           │ IAM Roles                                      │
-│ ─────────────────┼─────────────────────────────────────────────── │
-│ My Company Prod  │ CrossAccountRole                               │
-└───────────────────────────────────────────────────────────────────┘
+╭── IAM Roles Missing ExternalId Condition ──╮
+│ Entity   │ Source │ Vulnerable IAM Roles    │
+│──────────┼────────┼─────────────────────────│
+│ Datadog  │ vendor │ DatadogIntegrationRole  │
+╰────────────────────────────────────────────╯
 
-┌────────────── ✅ Known Vendors with IAM Role Access ────────────┐
-│ Vendor           │ IAM Roles                                    │
-│ ─────────────────┼───────────────────────────────────────────── │
-│ Datadog          │ DatadogIntegrationRole                       │
-└─────────────────────────────────────────────────────────────────┘
+╭────────── AWS Trustline Results ──────────╮
+│ Summary:                                  │
+│ Trusted entities found: 1                 │
+│ Known vendors found: 1                    │
+│ Unknown AWS accounts found: 0             │
+│ Vulnerable IAM roles (missing ExternalId) │
+╰───────────────────────────────────────────╯
 
-┌───── ❓ Unknown AWS Accounts with IAM Role Access ─────────────┐
-│ AWS Account ID  │ IAM Roles                                    │
-│ ────────────────┼───────────────────────────────────────────── │
-│ 123456789012    │ SomeUnknownVendorRole                        │
-└────────────────────────────────────────────────────────────────┘
-
-┌──── ⚠️ Missing ExternalId Condition (VConfused Deputy) ──┐
-│ Entity         │ Vulnerable IAM Roles                    │
-│ ───────────────┼──────────────────────────────────────── │
-│ Datadog        │ DatadogIntegrationRole                  │
-└──────────────────────────────────────────────────────────┘
-
-┌────────────────── AWS Account Analysis Results ───────────────────┐
-│ Summary:                                                           │
-│ 🔒 Trusted entities found: 1                                       │
-│ 🔍 Known vendors found: 1                                          │
-│ ❓ Unknown AWS accounts found: 1                                   │
-│ ⚠️ Vulnerable IAM roles (missing ExternalId): 1                    │
-└───────────────────────────────────────────────────────────────────┘
-
-✅ Report generated: aws_account_analysis_20230515_123045.md
+Report generated: trustline_report_123456789012_20250425_123045.md
 ```
-
-## Report Format
-
-The generated markdown report will include:
-
-- Trusted entities with IAM role access
-- Known vendors with IAM role access
-- Unknown AWS accounts with IAM role access
-- IAM roles missing ExternalId condition (vulnerable to confused deputy)
-- Trusted entities with S3 bucket access
-- Known vendors with S3 bucket access
-- Unknown AWS accounts with S3 bucket access
 
 ## Contributing
 
-Contributions are welcome! If you know of additional AWS account IDs that should be added to the [reference data](https://github.com/fwdcloudsec/known_aws_accounts/), please also contribute to this repository.
+Contributions are welcome! If you know of additional AWS account IDs that should be added to the vendor reference data, please also contribute to the [fwd:cloudsec known_aws_accounts](https://github.com/fwdcloudsec/known_aws_accounts) repository.
 
 ## License
 
-This project is licensed under the MIT License.
+This project is licensed under the [MIT License](LICENSE.md).

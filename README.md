@@ -19,12 +19,12 @@ AWS Trustline analyzes IAM Role trust policies and S3 bucket policies to identif
 
 ```mermaid
 flowchart LR
-    A[fwd:cloudsec\nKnown Accounts] --> D[Trustline]
+    A["fwd:cloudsec<br/>Known Accounts"] --> D[Trustline]
     B[AWS Organizations] --> D
     C[trusted_accounts.yaml] --> D
-    D --> E[IAM Role\nTrust Policies]
-    D --> F[S3 Bucket\nPolicies]
-    E --> G[Analysis &\nReport]
+    D --> E["IAM Role<br/>Trust Policies"]
+    D --> F["S3 Bucket<br/>Policies"]
+    E --> G["Analysis &<br/>Report"]
     F --> G
 ```
 

@@ -3,7 +3,8 @@ name = "aws-trustline"
 version = "0.2.0"
 description = "Map and audit third-party trust relationships in your AWS account"
 readme = "README.md"
-license = { text = "MIT" }
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
 requires-python = ">=3.10"
 authors = [
     { name = "Victor Grenu", email = "victor@zoph.io" },
@@ -12,7 +13,6 @@ keywords = ["aws", "security", "iam", "trust-policy", "cloud-security"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: System Administrators",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -37,5 +37,5 @@ Issues = "https://github.com/zoph-io/aws-trustline/issues"
 trustline = "trustline:main"
 
 [build-system]
-requires = ["setuptools>=68.0"]
+requires = ["setuptools>=77.0"]
 build-backend = "setuptools.build_meta"

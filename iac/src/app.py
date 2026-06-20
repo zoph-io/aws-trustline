@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2025-2026 Victor Grenu / zoph.io
 """AWS Lambda handler that runs AWS Trustline on a schedule.
 
 Drives the Access Analyzer backend directly via the trustline module so we can

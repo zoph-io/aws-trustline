@@ -1,0 +1,12 @@
+AWS Trustline
+Copyright 2025-2026 Victor Grenu / zoph.io
+
+This product includes software developed at zoph.io (https://zoph.io).
+
+Companion project: IAMTrail (https://iamtrail.com).
+
+Third-party data sources used at runtime:
+  - fwd:cloudsec known_aws_accounts
+    https://github.com/fwdcloudsec/known_aws_accounts
+    Community-maintained list of AWS vendor account IDs, fetched over HTTPS
+    when the tool runs. Not redistributed in this repository.

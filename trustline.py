@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2025-2026 Victor Grenu / zoph.io
 """
 AWS Trustline - Map and audit third-party trust relationships in your AWS account.
 

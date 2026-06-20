@@ -336,4 +336,7 @@ Contributions are welcome! If you know of additional AWS account IDs that should
 
 ## License
 
-This project is licensed under the [MIT License](LICENSE.md).
+Licensed under the [Apache License 2.0](LICENSE). See [NOTICE](NOTICE) for
+required attribution when redistributing.
+
+Copyright 2025-2026 Victor Grenu / zoph.io.

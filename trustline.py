@@ -35,7 +35,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 REFERENCE_DATA_URL = (
     "https://raw.githubusercontent.com/fwdcloudsec/known_aws_accounts/main/accounts.yaml"

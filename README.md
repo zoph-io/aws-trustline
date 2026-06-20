@@ -68,19 +68,29 @@ python trustline.py
    pip install -r requirements.txt
    ```
 
-3. Configure AWS credentials (if not already done):
+3. Authenticate to AWS using **short-lived credentials**. Trustline uses the
+   standard boto3 credential provider chain, so anything that produces
+   temporary credentials in your shell will work. Recommended options:
 
-   ```bash
-   aws configure
-   ```
+   - **IAM Identity Center (AWS SSO)** via a named profile:
 
-   Or use environment variables:
+     ```bash
+     aws configure sso
+     aws sso login --profile my-profile
+     python trustline.py --profile my-profile
+     ```
 
-   ```bash
-   export AWS_ACCESS_KEY_ID="your-access-key"
-   export AWS_SECRET_ACCESS_KEY="your-secret-key"
-   export AWS_DEFAULT_REGION="your-region"
-   ```
+   - **`aws-vault`** wrapping any role-based or SSO profile:
+
+     ```bash
+     aws-vault exec my-profile -- python trustline.py
+     ```
+
+   - **An assumed IAM role** (instance profile, EKS Pod Identity, GitHub
+     OIDC, etc.) when running inside AWS or from CI.
+
+   Avoid long-lived IAM user access keys. If you must use them temporarily,
+   prefer scoped, short-rotation credentials and never commit them to disk.
 
 ## Usage
 

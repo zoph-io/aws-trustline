@@ -467,7 +467,7 @@ def generate_report(
                 "\nThis means the report may be missing trusted accounts from your AWS Organization.\n"
             )
             f.write(
-                "To fix this, ensure your IAM user/role has the `organizations:ListAccounts` permission.\n\n"
+                "To fix this, ensure the IAM identity running Trustline has the `organizations:ListAccounts` permission.\n\n"
             )
 
         f.write("# IAM Roles Analysis\n\n")

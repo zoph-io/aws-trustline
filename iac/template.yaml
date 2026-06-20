@@ -1,0 +1,239 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+
+Description: >
+  AWS Trustline scheduled scanner. Runs the IAM Access Analyzer backend on a
+  cron schedule, uploads the timestamped HTML report to S3, and optionally
+  alerts via SNS when public, unknown, or missing-ExternalId findings appear.
+
+Parameters:
+  Scope:
+    Type: String
+    Default: auto
+    AllowedValues: [auto, account, organization]
+    Description: >
+      Access Analyzer scope. 'account' uses ACCOUNT analyzers (this account
+      only); 'organization' uses ORGANIZATION analyzers (must be deployed in
+      the org management or AA delegated-admin account); 'auto' prefers an
+      ORGANIZATION analyzer when present.
+
+  Regions:
+    Type: String
+    Default: all
+    Description: >
+      Comma-separated AWS regions, or the literal 'all' to enumerate every
+      enabled region via ec2:DescribeRegions. External Access Analyzer is
+      regional for resource-based policies; IAM roles are global so any one
+      region covers them.
+
+  ScheduleExpression:
+    Type: String
+    Default: "cron(0 6 * * ? *)"
+    Description: >
+      EventBridge cron expression. Default runs daily at 06:00 UTC. Use 'rate'
+      expressions (e.g. 'rate(7 days)') for periodic runs.
+
+  ScheduleTimezone:
+    Type: String
+    Default: UTC
+    Description: IANA timezone for the EventBridge schedule (e.g. Europe/Paris).
+
+  AlertEmail:
+    Type: String
+    Default: ""
+    Description: >
+      (optional) email subscribed to the SNS alert topic for non-empty
+      findings. Leave blank to disable SNS entirely.
+
+  LambdaMemoryMB:
+    Type: Number
+    Default: 512
+    MinValue: 256
+    MaxValue: 3008
+
+  LambdaTimeoutSeconds:
+    Type: Number
+    Default: 600
+    MinValue: 60
+    MaxValue: 900
+    Description: >
+      Hard cap is 900s (15 min). For very large AWS Organizations consider
+      narrowing 'Regions' to the ones you actually use.
+
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 180, 365]
+
+  ReportRetentionDays:
+    Type: Number
+    Default: 365
+    MinValue: 30
+    MaxValue: 3650
+    Description: S3 lifecycle expiration for past report objects.
+
+Conditions:
+  EnableAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
+
+Resources:
+
+  ReportBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-old-reports
+            Status: Enabled
+            ExpirationInDays: !Ref ReportRetentionDays
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+          - Id: cleanup-incomplete-uploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+
+  ReportBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ReportBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt ReportBucket.Arn
+              - !Sub "${ReportBucket.Arn}/*"
+            Condition:
+              Bool:
+                "aws:SecureTransport": "false"
+
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Condition: EnableAlertEmail
+    Properties:
+      DisplayName: AWS Trustline Alerts
+      KmsMasterKeyId: alias/aws/sns
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlertEmail
+
+  TrustlineFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-scanner"
+      RetentionInDays: !Ref LogRetentionDays
+
+  TrustlineFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-scanner"
+      CodeUri: src/
+      Handler: app.lambda_handler
+      Runtime: python3.12
+      Architectures: [arm64]
+      MemorySize: !Ref LambdaMemoryMB
+      Timeout: !Ref LambdaTimeoutSeconds
+      LoggingConfig:
+        LogGroup: !Ref TrustlineFunctionLogGroup
+      Environment:
+        Variables:
+          SCOPE: !Ref Scope
+          REGIONS: !Ref Regions
+          REPORT_BUCKET: !Ref ReportBucket
+          ALERT_TOPIC_ARN: !If [EnableAlertEmail, !Ref AlertTopic, ""]
+          # Rich auto-detects non-TTY but force plain output for CloudWatch.
+          NO_COLOR: "1"
+          PYTHONUNBUFFERED: "1"
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Sid: AccessAnalyzerRead
+              Effect: Allow
+              Action:
+                - access-analyzer:ListAnalyzers
+                - access-analyzer:ListFindings
+                - access-analyzer:GetFinding
+              Resource: "*"
+            - Sid: IdentityAndDiscovery
+              Effect: Allow
+              Action:
+                - sts:GetCallerIdentity
+                - iam:ListAccountAliases
+                - ec2:DescribeRegions
+                - organizations:ListAccounts
+              Resource: "*"
+            - Sid: WriteReports
+              Effect: Allow
+              Action:
+                - s3:PutObject
+                - s3:PutObjectAcl
+              Resource: !Sub "${ReportBucket.Arn}/*"
+        - !If
+          - EnableAlertEmail
+          - Version: "2012-10-17"
+            Statement:
+              - Sid: PublishAlerts
+                Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref AlertTopic
+          - !Ref AWS::NoValue
+      Events:
+        DailyScan:
+          Type: ScheduleV2
+          Properties:
+            ScheduleExpression: !Ref ScheduleExpression
+            ScheduleExpressionTimezone: !Ref ScheduleTimezone
+            Description: AWS Trustline scheduled external-access scan
+            State: ENABLED
+
+Outputs:
+  ReportBucketName:
+    Description: S3 bucket where timestamped HTML reports are written.
+    Value: !Ref ReportBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-report-bucket"
+
+  ReportBucketConsoleUrl:
+    Description: Direct link to browse the report bucket in the S3 console.
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/s3/buckets/${ReportBucket}?region=${AWS::Region}&tab=objects"
+
+  FunctionName:
+    Description: Lambda function name (invoke manually for an on-demand scan).
+    Value: !Ref TrustlineFunction
+
+  FunctionLogGroup:
+    Description: CloudWatch Logs group for the scanner.
+    Value: !Ref TrustlineFunctionLogGroup
+
+  ManualInvokeCommand:
+    Description: Trigger an on-demand scan from the CLI.
+    Value: !Sub "aws lambda invoke --function-name ${TrustlineFunction} --cli-binary-format raw-in-base64-out --payload '{}' /tmp/trustline-out.json && cat /tmp/trustline-out.json"
+
+  AlertTopicArn:
+    Condition: EnableAlertEmail
+    Description: SNS topic ARN for non-empty findings alerts.
+    Value: !Ref AlertTopic

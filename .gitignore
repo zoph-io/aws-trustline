@@ -1,6 +1,7 @@
 # Reports
 trustline_report_*
 aws_account_analysis*
+reports/
 
 # Trusted accounts (may contain org-specific data)
 trusted_accounts.yaml
@@ -29,3 +30,8 @@ env/
 # OS
 .DS_Store
 Thumbs.db
+
+# SAM build artifacts
+iac/.aws-sam/
+iac/samconfig.toml
+iac/packaged.yaml

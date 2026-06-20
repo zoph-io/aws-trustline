@@ -1,0 +1,9 @@
+# trustline.py runtime dependencies. boto3 is provided by the Lambda runtime
+# but pinning it here makes local `sam build` / container builds deterministic.
+# Versions intentionally kept loose; the Lambda runtime ships fresh boto3 for
+# you on cold starts so the precise pip-installed version is rarely loaded.
+boto3>=1.34.0
+botocore>=1.34.0
+pyyaml>=6.0
+requests>=2.31.0
+rich>=13.7.0

@@ -189,8 +189,12 @@ The Lambda execution role is built inline in
 | `access-analyzer:GetFinding` | `*` (regional) | Future-proof for full-detail lookups |
 | `sts:GetCallerIdentity` | `*` | Identify the running account |
 | `iam:ListAccountAliases` | `*` | Friendlier names in the report |
+| `iam:ListServiceSpecificCredentials` | `*` | Long-lived API keys / service-specific credentials |
 | `ec2:DescribeRegions` | `*` | Enumerate enabled regions when `Regions=all` |
-| `organizations:ListAccounts` | `*` | Label org members in the report |
+| `ec2:DescribeImages` / `DescribeImageAttribute` | `*` | AMI launch permissions |
+| `ram:GetResourceShareAssociations` / `ListResourceSharePermissions` / `GetPermission` | `*` | RAM resource shares |
+| `ssm:ListDocuments` / `DescribeDocumentPermission` | `*` | SSM document shares |
+| `organizations:ListAccounts` / `DescribeOrganization` | `*` | Label org members; recognize this-org ARNs |
 | `s3:PutObject*` | `${ReportBucket}/*` | Upload generated HTML |
 | `sns:Publish` | `${AlertTopic}` | Alert on non-empty findings (only if `AlertEmail` set) |
 
@@ -242,6 +246,8 @@ iac/
 ├── samconfig.toml.sample    # `cp` and edit before `sam deploy`
 └── src/
     ├── app.py               # Lambda handler
-    ├── Makefile             # SAM build hook (bundles ../../trustline.py)
+    ├── trustline.py         # symlink to ../../trustline.py
+    ├── grants.py            # symlink to ../../grants.py
+    ├── Makefile             # SAM build hook (bundles trustline.py + grants.py)
     └── requirements.txt     # boto3/rich/requests/pyyaml pinning for the package
 ```

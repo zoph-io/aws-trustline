@@ -2,17 +2,20 @@
 # Copyright 2025-2026 Victor Grenu / zoph.io
 """AWS Lambda handler that runs AWS Trustline on a schedule.
 
-Drives the Access Analyzer backend directly via the trustline module so we can
-inspect totals after the scan (for SNS alerts) without parsing console output.
-The generated HTML report is uploaded to S3 under a date-partitioned key and
-an SNS notification is published when any finding warrants attention.
+Drives the Access Analyzer backend plus RAM / AMI / SSM / credential scanners
+so we can inspect totals after the scan (for SNS alerts) without parsing
+console output. The generated HTML report is uploaded to S3 under a
+date-partitioned key and an SNS notification is published when any leftover
+grant warrants attention.
 
 Expected environment variables:
-    REPORT_BUCKET     S3 bucket for HTML reports (required)
-    SCOPE             auto | account | organization (default: auto)
-    REGIONS           comma list, or 'all' for ec2:DescribeRegions enumeration
-                      (default: 'all')
-    ALERT_TOPIC_ARN   optional SNS topic ARN for alerts; empty disables SNS
+    REPORT_BUCKET       S3 bucket for HTML reports (required)
+    SCOPE               auto | account | organization (default: auto)
+    REGIONS             comma list, or 'all' for ec2:DescribeRegions enumeration
+                        (default: 'all')
+    ALERT_TOPIC_ARN     optional SNS topic ARN for alerts; empty disables SNS
+    WAIT_FOR_ANALYZER   1/true to poll until AA finding counts stabilize
+    WAIT_TIMEOUT        seconds for that wait (default: 300)
 """
 from __future__ import annotations
 
@@ -59,12 +62,25 @@ def lambda_handler(event, context):  # noqa: ARG001
         if meta.get("source") == "aws_org"
     }
     account_aliases = trustline.get_account_aliases(session)
+    our_organization_id = trustline.fetch_organization_id(session)
 
-    # resolve_regions is driven off of argparse-like attributes; build a
-    # Namespace that mirrors the CLI surface so we can reuse it as-is.
+    wait_for_analyzer = os.environ.get("WAIT_FOR_ANALYZER", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    wait_timeout = int(os.environ.get("WAIT_TIMEOUT") or trustline.DEFAULT_WAIT_TIMEOUT)
+
+    # resolve_regions / optional scanners are driven off argparse-like attributes.
     args = argparse.Namespace(
         regions=None if regions_setting in ("", "all") else regions_setting,
         all_regions=(regions_setting == "all"),
+        skip_ram=False,
+        skip_ami=False,
+        skip_ssm=False,
+        skip_credentials=False,
+        wait_for_analyzer=wait_for_analyzer,
+        wait_timeout=wait_timeout,
     )
     try:
         regions = trustline.resolve_regions(session, args)
@@ -97,6 +113,14 @@ def lambda_handler(event, context):  # noqa: ARG001
         logger.info("Using %s analyzer in %s: %s",
                     analyzer["type"], region, analyzer["name"])
 
+    wait_notes: list = []
+    if wait_for_analyzer:
+        wait_notes = trustline.wait_for_analyzer_findings(
+            session, analyzers, timeout=wait_timeout
+        )
+        for note in wait_notes:
+            logger.info("Analyzer wait: %s", note)
+
     report_data = trustline.collect_access_analyzer_findings(
         session=session,
         account_to_vendor=account_to_vendor,
@@ -104,6 +128,36 @@ def lambda_handler(event, context):  # noqa: ARG001
         account_aliases=account_aliases,
         org_accounts=org_accounts,
         analyzers=analyzers,
+        our_organization_id=our_organization_id,
+    )
+
+    current_account_id = next(iter(account_aliases), "")
+    kwargs = trustline.grant_collect_context(
+        account_to_vendor=account_to_vendor,
+        trusted_accounts=trusted_accounts,
+        current_account_id=current_account_id,
+        our_organization_id=our_organization_id,
+        account_aliases=account_aliases,
+        org_accounts=org_accounts,
+    )
+    extra, scanned, skipped = trustline.collect_optional_scanners(
+        session, args, regions, kwargs
+    )
+    grants = list(report_data.get("grants") or []) + extra
+    report_data["grants"] = grants
+    report_data["totals"] = trustline.totals_from_grants(grants)
+    report_data["totals"]["regions"] = len(analyzers)
+    report_data["totals"]["owner_accounts"] = len(report_data.get("owner_accounts") or [])
+    report_data["coverage"] = trustline.build_coverage(
+        backend="access_analyzer",
+        scanned=(
+            [{"surface": "IAM Access Analyzer external findings", "detail": ", ".join(analyzers)}]
+            + scanned
+        ),
+        skipped=skipped,
+        regions=regions,
+        all_regions=bool(args.all_regions),
+        analyzer_notes=wait_notes + list(report_data.get("analyzer_notes") or []),
     )
 
     effective_scope = scope
@@ -159,11 +213,13 @@ def lambda_handler(event, context):  # noqa: ARG001
 
 
 def _should_alert(totals: dict) -> bool:
-    """Alert when any externally-attributable risk signal is non-zero."""
+    """Alert when any leftover external-access signal is non-zero."""
     return (
         totals.get("public", 0) > 0
         or totals.get("unknown", 0) > 0
         or totals.get("missing_external_id", 0) > 0
+        or totals.get("missing_oidc_subject", 0) > 0
+        or totals.get("never_expires", 0) > 0
     )
 
 
@@ -176,21 +232,24 @@ def _publish_findings_alert(
     key: str,
 ) -> None:
     subject = (
-        f"Trustline alert: {totals['public']} public, "
-        f"{totals['unknown']} unknown, "
-        f"{totals['missing_external_id']} missing-ExternalId"
+        f"Trustline alert: {totals.get('public', 0)} public, "
+        f"{totals.get('unknown', 0)} unknown, "
+        f"{totals.get('missing_external_id', 0)} missing-ExternalId"
     )
     body = (
         f"AWS Trustline scheduled scan finished with findings that warrant review.\n\n"
         f"Scope: {scope}\n"
         f"Regions analyzed: {len(analyzers)} ({', '.join(sorted(analyzers))})\n"
         f"Owner accounts seen: {totals.get('owner_accounts', 0)}\n\n"
-        f"Public findings (shared with the world): {totals.get('public', 0)}\n"
-        f"Unknown external principal findings: {totals.get('unknown', 0)}\n"
+        f"Public grants: {totals.get('public', 0)}\n"
+        f"Unknown principal grants: {totals.get('unknown', 0)}\n"
+        f"Federated principals: {totals.get('federated', 0)}\n"
         f"IAM roles missing ExternalId: {totals.get('missing_external_id', 0)}\n"
-        f"Known-vendor findings: {totals.get('vendors', 0)}\n"
-        f"Trusted findings: {totals.get('trusted', 0)}\n"
-        f"Total findings: {totals.get('findings', 0)}\n\n"
+        f"OIDC missing sub/aud: {totals.get('missing_oidc_subject', 0)}\n"
+        f"Never-expiring service credentials: {totals.get('never_expires', 0)}\n"
+        f"Known-vendor grants: {totals.get('vendors', 0)}\n"
+        f"Trusted grants: {totals.get('trusted', 0)}\n"
+        f"Total grants: {totals.get('findings', 0)}\n\n"
         f"Full HTML report: s3://{bucket}/{key}\n"
     )
     _publish_alert(topic_arn, subject, body)

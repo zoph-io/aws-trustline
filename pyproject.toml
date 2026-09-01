@@ -1,6 +1,6 @@
 [project]
 name = "aws-trustline"
-version = "0.2.0"
+version = "0.3.0"
 description = "Map and audit third-party trust relationships in your AWS account"
 readme = "README.md"
 license = "Apache-2.0"
@@ -35,6 +35,9 @@ Issues = "https://github.com/zoph-io/aws-trustline/issues"
 
 [project.scripts]
 trustline = "trustline:main"
+
+[tool.setuptools]
+py-modules = ["trustline", "grants"]
 
 [build-system]
 requires = ["setuptools>=77.0"]

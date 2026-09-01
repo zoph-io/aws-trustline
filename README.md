@@ -1,23 +1,22 @@
 # AWS Trustline
 
-> Map and audit third-party trust relationships in your AWS account.
+> Map external access grants in your AWS account. Name the vendor when the account is known. Say what you did not scan.
 
-AWS Trustline analyzes IAM Role trust policies and S3 bucket policies to identify who has access to your AWS resources. It cross-references AWS account IDs found in these policies against a community-maintained list of [known AWS accounts](https://github.com/fwdcloudsec/known_aws_accounts) from [fwd:cloudsec](https://fwdcloudsec.org/) to automatically identify the vendors behind those accounts.
+AWS Trustline expands sharing records into **grant rows** (one resource × one principal × one mechanism) and classifies each row against a community-maintained list of [known AWS accounts](https://github.com/fwdcloudsec/known_aws_accounts) from [fwd:cloudsec](https://fwdcloudsec.org/). Unknown leftover is the work list. The report always includes a **coverage banner** so a green summary is not mistaken for “we looked at everything AWS can share.”
 
 ## Features
 
-- **Two analysis backends**:
-  - **Policy scanner (default)**: scans IAM role trust policies and S3 bucket policies directly with the AWS SDK.
-  - **Access Analyzer backend (`--use-access-analyzer`)**: consumes findings from AWS IAM Access Analyzer (external access, **free tier**) for provable, all-resource-type coverage: S3, IAM roles, KMS, Lambda, SNS, SQS, Secrets Manager, EFS, EBS/RDS snapshots, ECR, DynamoDB.
-- **Account or Organization scope**: pick `--scope account` for a single-account analyzer, `--scope organization` to consume findings from an org-wide analyzer (run from the management or AA delegated-admin account).
-- **Multi-region**: `--regions us-east-1,eu-west-1` or `--all-regions` (enumerated via `ec2:DescribeRegions`).
-- **Vendor Identification**: matches external account IDs against 500+ known AWS vendor accounts from [fwd:cloudsec](https://github.com/fwdcloudsec/known_aws_accounts).
-- **Confused Deputy Detection**: flags IAM roles missing the `ExternalId` condition on cross-account trust (works in both backends).
-- **Public access detection**: the Access Analyzer backend surfaces resources shared with the world in a dedicated section.
-- **AWS Organizations Support**: automatically fetches your org accounts as trusted entities and labels them in org-scoped reports.
-- **Custom Trusted Accounts**: define your own trusted accounts via YAML configuration.
-- **HTML and Markdown reports**: self-contained HTML report (no JS, viewable offline) in the [iamtrail.com](https://iamtrail.com) design system, plus the original Markdown report.
-- **CLI Flexibility**: AWS profiles, regions, selective analysis, custom output paths.
+- **Grant rows**: one resource giving access to one principal, tagged with the mechanism (trust policy, bucket policy, RAM share, AMI launch permission, SSM document share, service-specific credential, or Access Analyzer finding).
+- **Two analysis backends** for IAM/S3-class resources:
+  - **Policy scanner (default)**: reads IAM role trust policies and S3 bucket policies directly. Walks `Principal.AWS`, `Principal.Federated`, and `Principal: "*"`. Never treats the account ID in an OIDC provider ARN as the external party.
+  - **Access Analyzer backend (`--use-access-analyzer`)**: consumes findings from AWS IAM Access Analyzer (external access, **free tier**) for the 15 AA-supported types. Analyzer status `ACTIVE` is not scan-complete; pass `--wait-for-analyzer` to poll until finding counts stabilize.
+- **RAM, AMI, SSM, credentials** (both backends unless skipped): Resource Access Manager shares, AMI launch permissions (an `OrganizationArn` is not assumed internal), SSM document shares, and IAM service-specific credentials / long-lived API keys (Bedrock, CloudWatch, CodeCommit, Keyspaces, Claude Platform).
+- **Classification**: _trusted_ (org + YAML), _known vendor_ (fwd:cloudsec + AWS aliases such as Redshift Support), _federated_ (GitHub Actions OIDC, GitLab, SAML, Cognito), _public_, _unknown_.
+- **Confused deputy**: missing `sts:ExternalId` on cross-account role trusts, and missing `sub`/`aud` on GitHub/GitLab OIDC trusts.
+- **Coverage banner**: every HTML/Markdown report lists what was scanned and what was not (including Lake Formation, Kafka ACLs, and the AA 15-type ceiling).
+- **Account or Organization scope** for Access Analyzer: `--scope account` or `--scope organization`.
+- **Multi-region**: `--regions us-east-1,eu-west-1` or `--all-regions` (RAM, AMI, SSM, and AA are regional).
+- **HTML and Markdown reports**: self-contained HTML (no JS) in the [iamtrail.com](https://iamtrail.com) design system.
 
 ## How It Works
 
@@ -26,23 +25,19 @@ flowchart LR
     A["fwd:cloudsec<br/>Known Accounts"] --> D[Trustline]
     B[AWS Organizations] --> D
     C[trusted_accounts.yaml] --> D
-    D --> P["Policy scanner<br/>(default)"]
+    D --> P["Policy scanner<br/>IAM trusts + S3"]
     D --> AA["Access Analyzer<br/>--use-access-analyzer"]
-    P --> E["IAM Role<br/>Trust Policies"]
-    P --> F["S3 Bucket<br/>Policies"]
-    AA --> G["External-access findings<br/>(all AA-supported types)"]
-    E --> R["Classify &<br/>Report"]
-    F --> R
-    G --> R
+    D --> X["RAM / AMI / SSM / API keys"]
+    P --> G["Grant rows"]
+    AA --> G
+    X --> G
+    G --> R["Classify leftover<br/>+ coverage banner"]
 ```
 
-1. **Gather reference data**: fetches the latest known AWS vendor accounts from fwd:cloudsec, your AWS Organization members, and any locally defined trusted accounts
-2. **Collect access information**
-   - Default backend reads all IAM role trust policies and S3 bucket policies in the target account.
-   - Access Analyzer backend pulls findings from existing external analyzers (account-scoped or org-scoped) in the target regions.
-3. **Classify access**: categorizes every external principal as _trusted_, _known vendor_, _public_, or _unknown_
-4. **Detect vulnerabilities**: flags cross-account roles missing the `ExternalId` condition (confused deputy risk)
-5. **Report**: displays results in the console and writes an HTML report (and/or Markdown via `--format`)
+1. **Gather reference data**: fwd:cloudsec vendor accounts, AWS Organization members (and org ID), YAML trusted accounts.
+2. **Collect grants** from the selected scanners. Each Allow principal becomes its own row.
+3. **Classify**: trusted / vendor / federated / public / unknown. Flag missing ExternalId and OIDC `sub`/`aud`. Flag never-expiring service-specific credentials.
+4. **Report**: console + HTML/Markdown, led by the unknown leftover and a coverage banner.
 
 ## Quick Start
 
@@ -97,22 +92,15 @@ python trustline.py
 ### Policy scanner (default)
 
 ```bash
-# Basic usage (analyzes IAM roles and S3 buckets in the current account)
+# IAM trusts, S3 policies, RAM, AMI, SSM, service-specific credentials
+# (regional collectors use the session region unless you pass --all-regions)
 python trustline.py
 
-# Use a specific AWS profile
-python trustline.py --profile production
+# Every enabled region for RAM / AMI / SSM
+python trustline.py --all-regions --format both
 
-# Skip S3 analysis (IAM roles only)
-python trustline.py --skip-s3
-
-# Custom output directory and trusted accounts file
-# (default output is ./reports/, with files named
-#  trustline_report_<account-or-org>_<YYYYmmdd_HHMMSS>.<html|md>)
-python trustline.py --output /tmp/reports --trusted-accounts my-accounts.yaml
-
-# Emit both Markdown and HTML
-python trustline.py --format both
+# Skip the slower regional collectors
+python trustline.py --skip-ram --skip-ami --skip-ssm
 ```
 
 ### Access Analyzer backend
@@ -120,8 +108,8 @@ python trustline.py --format both
 Consumes findings from an **existing** external IAM Access Analyzer (external-access analyzers are free; see [Cost](#cost)). The tool will not create analyzers for you. If none exists in the requested scope/regions it prints the `aws accessanalyzer create-analyzer` command to run.
 
 ```bash
-# Current account, current region
-python trustline.py --use-access-analyzer
+# Current account, current region, wait until finding counts stabilize
+python trustline.py --use-access-analyzer --wait-for-analyzer
 
 # Org-wide (run from the management or AA delegated-admin account), all regions
 python trustline.py --use-access-analyzer --scope organization --all-regions
@@ -133,6 +121,8 @@ python trustline.py --use-access-analyzer --regions us-east-1,eu-west-1 \
 # Auto-detect (prefers an ORGANIZATION analyzer if present)
 python trustline.py --use-access-analyzer --scope auto
 ```
+
+RAM, AMI, SSM, and service-specific credentials still run alongside Access Analyzer unless you pass the matching `--skip-*` flags.
 
 When `--scope organization` is used, findings are grouped and labeled by `resourceOwnerAccount` using the names from AWS Organizations.
 
@@ -146,10 +136,16 @@ When `--scope organization` is used, findings are grouped and labeled by `resour
 | `--trusted-accounts` | `-t` | Path to trusted accounts YAML (default: `trusted_accounts.yaml`) |
 | `--skip-iam` | | Skip IAM role trust policy analysis (policy scanner only) |
 | `--skip-s3` | | Skip S3 bucket policy analysis (policy scanner only) |
-| `--use-access-analyzer` | | Use IAM Access Analyzer findings as the source of truth |
+| `--skip-ram` | | Skip RAM resource shares |
+| `--skip-ami` | | Skip AMI launch permissions |
+| `--skip-ssm` | | Skip SSM document shares |
+| `--skip-credentials` | | Skip IAM service-specific credentials / long-lived API keys |
+| `--use-access-analyzer` | | Use IAM Access Analyzer findings instead of the IAM/S3 policy scanner |
+| `--wait-for-analyzer` | | Poll AA until ACTIVE finding counts stabilize (`ACTIVE` ≠ scan finished) |
+| `--wait-timeout` | | Seconds to wait (default: 300) |
 | `--scope` | | `auto` (default), `account`, or `organization` |
-| `--regions` | | Comma-separated regions for the AA backend (e.g. `us-east-1,eu-west-1`) |
-| `--all-regions` | | Query every enabled region (AA backend, enumerated via `ec2:DescribeRegions`) |
+| `--regions` | | Comma-separated regions for RAM/AMI/SSM/AA |
+| `--all-regions` | | Query every enabled region (enumerated via `ec2:DescribeRegions`) |
 | `--format` | | `html` (AA default), `md` (policy-scanner default), or `both` |
 | `--verbose` | | Show full error tracebacks |
 | `--version` | `-V` | Print version and exit |
@@ -168,7 +164,12 @@ The **external access analyzer is free**. There is no per-resource or per-region
   "Statement": [
     {
       "Effect": "Allow",
-      "Action": ["iam:ListRoles", "iam:GetRole", "iam:ListAccountAliases"],
+      "Action": [
+        "iam:ListRoles",
+        "iam:GetRole",
+        "iam:ListAccountAliases",
+        "iam:ListServiceSpecificCredentials"
+      ],
       "Resource": "*"
     },
     {
@@ -178,29 +179,48 @@ The **external access analyzer is free**. There is no per-resource or per-region
     },
     {
       "Effect": "Allow",
+      "Action": [
+        "ram:GetResourceShareAssociations",
+        "ram:ListResourceSharePermissions",
+        "ram:GetPermission"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["ec2:DescribeRegions", "ec2:DescribeImages", "ec2:DescribeImageAttribute"],
+      "Resource": "*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["ssm:ListDocuments", "ssm:DescribeDocumentPermission"],
+      "Resource": "*"
+    },
+    {
+      "Effect": "Allow",
       "Action": ["sts:GetCallerIdentity"],
       "Resource": "*"
     },
     {
       "Effect": "Allow",
-      "Action": ["organizations:ListAccounts"],
+      "Action": ["organizations:ListAccounts", "organizations:DescribeOrganization"],
       "Resource": "*"
     }
   ]
 }
 ```
 
-Or use existing AWS managed policies:
+Or use existing AWS managed policies plus the RAM/SSM/EC2 image actions above:
 
-- `IAMReadOnlyAccess` (IAM role analysis)
-- `AmazonS3ReadOnlyAccess` (S3 bucket policy analysis)
-- `AWSOrganizationsReadOnlyAccess` (Organization account listing)
+- `IAMReadOnlyAccess` (roles and service-specific credentials)
+- `AmazonS3ReadOnlyAccess` (S3 bucket policies)
+- `AWSOrganizationsReadOnlyAccess` (organization members and org ID)
 
-The Organizations permission is optional; if unavailable, only the YAML-configured trusted accounts will be used.
+Organizations permissions are optional; if unavailable, only the YAML-configured trusted accounts will be used, and organization ARNs on AMIs/RAM shares will not be recognized as “this org.”
 
 ### Access Analyzer backend (`--use-access-analyzer`)
 
-Add the following to the IAM permissions above:
+Add:
 
 ```json
 {
@@ -214,17 +234,12 @@ Add the following to the IAM permissions above:
         "access-analyzer:GetFinding"
       ],
       "Resource": "*"
-    },
-    {
-      "Effect": "Allow",
-      "Action": ["ec2:DescribeRegions"],
-      "Resource": "*"
     }
   ]
 }
 ```
 
-`ec2:DescribeRegions` is only needed when `--all-regions` is used. For `--scope organization`, the caller must be in the AWS Organizations management account or the IAM Access Analyzer delegated-admin account so that the org-level analyzer exists in their account.
+`ec2:DescribeRegions` is needed for `--all-regions`. For `--scope organization`, the caller must be in the AWS Organizations management account or the IAM Access Analyzer delegated-admin account.
 
 ## Trusted Accounts Configuration
 
@@ -255,42 +270,53 @@ If `trusted_accounts.yaml` does not exist, the tool relies solely on AWS Organiz
 
 ## Security Checks
 
-### Confused Deputy Detection
+### Confused deputy (`sts:ExternalId`)
 
-The tool checks whether IAM roles with cross-account access include an `ExternalId` condition. The [confused deputy problem](https://docs.aws.amazon.com/IAM/latest/UserGuide/confused-deputy.html) occurs when a third-party service is tricked into misusing its access to act on behalf of another account. Roles that allow external `AssumeRole` without an `ExternalId` condition are flagged as vulnerable.
+Cross-account role trusts without `sts:ExternalId` are flagged per grant (per statement), not per role. Both backends produce this signal.
 
-Both backends produce this signal: the policy scanner re-derives it from each role's trust policy, and the Access Analyzer backend re-derives it from the `condition` map carried on each `AWS::IAM::Role` finding.
+### OIDC subject / audience
 
-### Public access (Access Analyzer backend)
+GitHub Actions OIDC trusts missing `token.actions.githubusercontent.com:sub` or `:aud`, and GitLab OIDC trusts missing `sub`, are flagged. The account ID in the OIDC provider ARN is **not** treated as the external party.
 
-The AA backend surfaces any resource that the analyzer determined is shared with everyone (`isPublic == true`, e.g. an S3 bucket with `Principal: "*"` and no compensating condition / Public Access Block) in a dedicated section of the report.
+### Public access
+
+`Principal: "*"` / AMI `Group=all` / SSM `AccountIds=all` become public grants. Access Analyzer additionally respects Block Public Access and Deny when you use `--use-access-analyzer`.
+
+### Never-expiring service-specific credentials
+
+Active IAM service-specific credentials with no expiration (Bedrock / CloudWatch API keys default to this on the CLI) are listed as leftover.
+
+### Coverage banner
+
+Reports list scanned surfaces and explicitly out-of-scope items (Lake Formation, Kafka ACLs, copies, …). A green summary only covers what was scanned.
 
 ## Choosing a backend
 
 | Aspect | Policy scanner (default) | Access Analyzer (`--use-access-analyzer`) |
 |---|---|---|
 | Setup | None, runs immediately | Requires an existing external analyzer (free); will instruct you how to create one |
-| Resource coverage | IAM roles + S3 buckets | All [AA-supported types](https://docs.aws.amazon.com/IAM/latest/UserGuide/access-analyzer-resources.html): IAM, S3, KMS, Lambda, SNS, SQS, Secrets Manager, EBS/RDS snapshots, ECR, EFS, DynamoDB |
-| Cross-account accuracy | Regex over `Principal.AWS` (ignores Deny / conditions / Public Access Block) | Provable reasoning (respects Deny, conditions, Public Access Block, org zone-of-trust) |
-| Org scope | Single account | Single account *or* whole AWS Organization (with one ORGANIZATION analyzer) |
-| Public detection | No | Yes, dedicated section |
-| Confused-deputy check | Yes | Yes |
+| IAM / S3-class coverage | IAM role trusts + S3 bucket policies | All [AA-supported types](https://docs.aws.amazon.com/IAM/latest/UserGuide/access-analyzer-resources.html) (15 types) |
+| RAM / AMI / SSM / API keys | Yes (unless `--skip-*`) | Yes (unless `--skip-*`) |
+| Cross-account accuracy | Allow-principal matching (ignores Deny / BPA) | Provable reasoning (Deny, conditions, BPA, org zone-of-trust) |
+| Federated principals | Yes (own section) | Yes (own section; not mixed into unknown) |
+| Public detection | Wildcards / `all` groups | AA `isPublic` plus the same extra scanners |
+| Freshness | Live API calls | Cached findings; `--wait-for-analyzer` polls until counts stabilize |
 | Cost | Free | Free (external-access analyzers are no-charge) |
-| Freshness | Live API calls | Reads cached findings (AA refreshes asynchronously) |
 
-A few things to know about the Access Analyzer backend:
+A few things to know about Access Analyzer:
 
-- **Findings are generated asynchronously** by IAM Access Analyzer. After creating an analyzer it may take a few minutes for findings to appear; Trustline does not wait.
-- **External analyzers are regional** for resource-based policies (S3, KMS, SQS, etc.). IAM roles are global, so any one region covers them. Use `--all-regions` to cover everything.
-- **Organization-scope analyzers treat sibling org accounts as in-zone-of-trust**, so they will *not* show up as findings (less noise, but fewer "trusted entity" rows than the policy scanner's regex backend).
+- **`ACTIVE` is not scan-complete.** There is no API field that says the first scan finished. Use `--wait-for-analyzer` (default timeout 300s). First scans can take ~20 minutes.
+- **The 15-type ceiling is printed in the coverage banner.** AA does not cover RAM shares, AMI launch permissions, or SSM document shares; Trustline scans those separately.
+- **Lambda aliases/versions and service principals** are AA exclusions and stay in the not-scanned list.
+- **Organization-scope analyzers** treat sibling org accounts as in-zone-of-trust, so they will not show up as AA findings.
 
 ## Sample Output
 
 ```
 ╭──────────────────── AWS Trustline ────────────────────╮
 │ AWS Trustline                                         │
-│ Map and audit third-party trust relationships in your │
-│ AWS account.                                          │
+│ Map external access grants and name the vendor when   │
+│ the account is known.                                 │
 ╰───────────────────────────────────────────────────────╯
 
 Fetching reference data of known AWS accounts...
@@ -298,29 +324,23 @@ Found 480 known AWS accounts in the reference data
 Loading trusted AWS accounts...
 Found 12 accounts in AWS Organization
 
-Analyzing AWS Account: 123456789012 (my-company-dev)
-
-╭─ Known Vendors with IAM Role Access ─╮
-│ Vendor   │ IAM Roles                  │
-│──────────┼────────────────────────────│
-│ Datadog  │ DatadogIntegrationRole     │
-╰──────────────────────────────────────╯
-
-╭── IAM Roles Missing ExternalId Condition ──╮
-│ Entity   │ Source │ Vulnerable IAM Roles    │
-│──────────┼────────┼─────────────────────────│
-│ Datadog  │ vendor │ DatadogIntegrationRole  │
-╰────────────────────────────────────────────╯
+╭─ What this run looked at ─╮
+│ Scanned: IAM role trust policies, S3 bucket policies, │
+│ RAM resource shares, AMI launch permissions, …        │
+╰───────────────────────────────────────────────────────╯
 
 ╭────────── AWS Trustline Results ──────────╮
-│ Summary:                                  │
-│ Trusted entities found: 1                 │
-│ Known vendors found: 1                    │
-│ Unknown AWS accounts found: 0             │
-│ Vulnerable IAM roles (missing ExternalId) │
+│ Trusted: 1                                │
+│ Known vendors: 1                          │
+│ Federated: 2                              │
+│ Unknown: 0                                │
+│ Public: 0                                 │
+│ Missing ExternalId: 1                     │
+│ OIDC missing sub/aud: 0                   │
+│ Never-expiring credentials: 0             │
 ╰───────────────────────────────────────────╯
 
-Report generated: trustline_report_123456789012_20250425_123045.md
+Report generated: trustline_report_123456789012_20260901_123045.md
 ```
 
 ## Scheduled scanning on AWS

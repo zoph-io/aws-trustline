@@ -185,8 +185,25 @@ Resources:
               Action:
                 - sts:GetCallerIdentity
                 - iam:ListAccountAliases
+                - iam:ListServiceSpecificCredentials
                 - ec2:DescribeRegions
+                - ec2:DescribeImages
+                - ec2:DescribeImageAttribute
                 - organizations:ListAccounts
+                - organizations:DescribeOrganization
+              Resource: "*"
+            - Sid: RamShares
+              Effect: Allow
+              Action:
+                - ram:GetResourceShareAssociations
+                - ram:ListResourceSharePermissions
+                - ram:GetPermission
+              Resource: "*"
+            - Sid: SsmDocumentShares
+              Effect: Allow
+              Action:
+                - ssm:ListDocuments
+                - ssm:DescribeDocumentPermission
               Resource: "*"
             - Sid: WriteReports
               Effect: Allow

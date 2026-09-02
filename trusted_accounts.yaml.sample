@@ -1,25 +1,22 @@
 # Trusted Accounts Configuration
-# This is a sample file for configuring trusted AWS accounts in your organization.
-# Rename this file to 'trusted_accounts.yaml' to use it.
+# Copy to trusted_accounts.yaml (gitignored). Member accounts cannot call
+# organizations:ListAccounts — without this file, org siblings show as unknown.
 
-# Each entry represents a group of trusted AWS accounts
-# Format follows the same pattern as the known AWS accounts reference
+# Each entry is a named group of 12-digit account IDs.
 
-- name: 'My Company Production'
-  description: 'Production AWS accounts'
-  accounts: 
-    - '123456789012'
-    - '234567890123'
-
-- name: 'My Company Development'
-  description: 'Development and testing AWS accounts'
+- name: "My Company Production"
+  description: "Production AWS accounts"
   accounts:
-    - '345678901234'
-    - '456789012345'
+    - "123456789012"
+    - "234567890123"
 
-- name: 'Subsidiary Company'
-  description: 'Our subsidiary organization AWS accounts'
+- name: "My Company Development"
+  description: "Development and testing AWS accounts"
   accounts:
-    - '567890123456'
+    - "345678901234"
+    - "456789012345"
 
-# Add more entries as needed 
+- name: "Subsidiary Company"
+  description: "Our subsidiary organization AWS accounts"
+  accounts:
+    - "567890123456"

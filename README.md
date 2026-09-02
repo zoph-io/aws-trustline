@@ -266,13 +266,15 @@ Define your own trusted AWS accounts to distinguish internal accounts from exter
        - "345678901234"
    ```
 
-If `trusted_accounts.yaml` does not exist, the tool relies solely on AWS Organizations data (if accessible).
+If `trusted_accounts.yaml` does not exist, the tool relies solely on AWS Organizations data (if accessible). **Member accounts cannot list the org** — copy the sample and list sibling account IDs, or those trusts land on the unknown work list.
+
+YAML names win over fwd:cloudsec vendor aliases for the same account ID (so your own prod account is trusted, not a “vendor”).
 
 ## Security Checks
 
 ### Confused deputy (`sts:ExternalId`)
 
-Cross-account role trusts without `sts:ExternalId` are flagged per grant (per statement), not per role. Both backends produce this signal.
+Cross-account role trusts without `sts:ExternalId` are flagged per grant (per statement), not per role. **Not flagged:** principals already classified trusted (org/YAML/CloudFront), and AWS org bootstrap roles (`OrganizationAccountAccessRole`, `stacksets-exec-*`, Control Tower execution). Vendors without ExternalId still are — that is the Datadog-shaped case.
 
 ### OIDC subject / audience
 

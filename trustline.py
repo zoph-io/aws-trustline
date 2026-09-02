@@ -52,7 +52,7 @@ from grants import (
     merge_builtin_vendors,
     oidc_condition_gaps,
     parse_principal_value,
-    statement_has_external_id,
+    should_flag_missing_external_id,
     totals_from_grants,
 )
 
@@ -172,19 +172,33 @@ def fetch_trusted_accounts(
 
         yaml_count = 0
         for entity in trusted_data:
-            for account_id in entity.get("accounts", []):
-                if account_id not in trusted_accounts:
-                    trusted_accounts[account_id] = {
-                        "name": entity.get("name", "Internal"),
-                        "type": "trusted",
-                        "description": entity.get("description", ""),
-                        "source": "yaml_file",
-                    }
-                    yaml_count += 1
+            if not isinstance(entity, dict):
+                continue
+            for raw_id in entity.get("accounts", []):
+                account_id = str(raw_id).strip()
+                if len(account_id) != 12 or not account_id.isdigit():
+                    continue
+                trusted_accounts[account_id] = {
+                    "name": entity.get("name", "Internal"),
+                    "type": "trusted",
+                    "description": entity.get("description", ""),
+                    "source": "yaml_file",
+                }
+                yaml_count += 1
 
         console.print(
-            f"[green]Loaded {yaml_count} additional trusted AWS accounts from YAML file[/green]"
+            f"[green]Loaded {yaml_count} trusted AWS accounts from YAML file[/green]"
         )
+        if org_error and yaml_count:
+            org_error = (
+                f"{org_error} Using trusted_accounts.yaml instead "
+                f"({yaml_count} account(s))."
+            )
+        elif org_error and yaml_count == 0:
+            console.print(
+                "[yellow]Member accounts cannot list Organizations. "
+                "Copy trusted_accounts.yaml.sample to trusted_accounts.yaml.[/yellow]"
+            )
         return trusted_accounts, org_error
 
     except Exception as e:
@@ -837,6 +851,27 @@ def _grant_resource_name(grant: dict[str, Any]) -> str:
     return _short_resource(grant.get("resource") or "")
 
 
+def _federated_sort_key(grant: dict[str, Any]) -> tuple[int, str]:
+    """GitHub/GitLab first (actionable), Cognito last (app identity)."""
+    label = (grant.get("principal_label") or "").lower()
+    resource = grant.get("resource") or ""
+    if "github" in label or "gitlab" in label:
+        return (0, resource)
+    if "cognito" in label:
+        return (2, resource)
+    return (1, resource)
+
+
+def _matching_grants(grants: list[dict[str, Any]], predicate) -> list[dict[str, Any]]:
+    return [g for g in grants if predicate(g)]
+
+
+def _federated_grants(grants: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    items = _matching_grants(grants, lambda g: g.get("classification") == "federated")
+    items.sort(key=_federated_sort_key)
+    return items
+
+
 def generate_markdown_report(
     grants: list[dict[str, Any]],
     coverage: dict[str, Any],
@@ -905,9 +940,9 @@ def generate_markdown_report(
             "No unknown principals.",
         )
         write_grant_table(
-            "Federated principals (OIDC / SAML / Cognito)",
-            _rows(lambda g: g.get("classification") == "federated"),
-            "No federated principals.",
+            "OIDC trusts missing sub/aud conditions",
+            _rows(lambda g: g.get("missing_oidc_subject")),
+            "No GitHub/GitLab OIDC trusts missing subject/audience conditions.",
         )
         write_grant_table(
             "IAM roles missing ExternalId condition",
@@ -915,14 +950,14 @@ def generate_markdown_report(
             "No cross-account roles missing sts:ExternalId.",
         )
         write_grant_table(
-            "OIDC trusts missing sub/aud conditions",
-            _rows(lambda g: g.get("missing_oidc_subject")),
-            "No GitHub/GitLab OIDC trusts missing subject/audience conditions.",
-        )
-        write_grant_table(
             "Never-expiring service-specific credentials",
             _rows(lambda g: g.get("never_expires")),
             "No active never-expiring service-specific credentials.",
+        )
+        write_grant_table(
+            "Federated principals (OIDC / SAML / Cognito)",
+            _federated_grants(grants),
+            "No federated principals.",
         )
         write_grant_table(
             "Known vendors",
@@ -984,9 +1019,9 @@ def display_grants(
         "yellow",
     )
     _table(
-        "Federated principals",
-        [g for g in grants if g.get("classification") == "federated"],
-        "yellow",
+        "OIDC missing sub/aud",
+        [g for g in grants if g.get("missing_oidc_subject")],
+        "red",
     )
     _table(
         "Missing ExternalId",
@@ -994,14 +1029,14 @@ def display_grants(
         "red",
     )
     _table(
-        "OIDC missing sub/aud",
-        [g for g in grants if g.get("missing_oidc_subject")],
-        "red",
-    )
-    _table(
         "Never-expiring credentials",
         [g for g in grants if g.get("never_expires")],
         "red",
+    )
+    _table(
+        "Federated principals",
+        _federated_grants(grants),
+        "yellow",
     )
     _table(
         "Known vendors",
@@ -1491,7 +1526,17 @@ def _classify_aa_finding(
         grant["principal_label"] = "Everyone (public)"
 
     if resource_type == "AWS::IAM::Role" and not grant["is_public"] and grant.get("principal_kind") == "aws_account":
-        grant["missing_external_id"] = not statement_has_external_id(condition)
+        grant["missing_external_id"] = should_flag_missing_external_id(
+            resource_type=resource_type,
+            mechanism="access_analyzer",
+            parsed={
+                "kind": grant.get("principal_kind"),
+                "is_public": grant.get("is_public"),
+            },
+            classification=grant.get("classification") or "unknown",
+            resource=resource,
+            condition=condition if isinstance(condition, dict) else {},
+        )
 
     if grant.get("principal_kind") == "federated":
         raw_fed = ""
@@ -2080,11 +2125,9 @@ def generate_html_report(
     )
     parts.append(
         section(
-            "Federated principals",
-            [g for g in grants if g.get("classification") == "federated"],
-            "No federated principals.",
-            subtitle="GitHub OIDC / GitLab / SAML / Cognito. Account ID in the provider ARN is yours.",
-            neutral=True,
+            "OIDC trusts missing sub/aud",
+            [g for g in grants if g.get("missing_oidc_subject")],
+            "No GitHub/GitLab trusts missing subject or audience conditions.",
         )
     )
     parts.append(
@@ -2096,16 +2139,18 @@ def generate_html_report(
     )
     parts.append(
         section(
-            "OIDC trusts missing sub/aud",
-            [g for g in grants if g.get("missing_oidc_subject")],
-            "No GitHub/GitLab trusts missing subject or audience conditions.",
+            "Never-expiring service-specific credentials",
+            [g for g in grants if g.get("never_expires")],
+            "No active never-expiring service-specific credentials.",
         )
     )
     parts.append(
         section(
-            "Never-expiring service-specific credentials",
-            [g for g in grants if g.get("never_expires")],
-            "No active never-expiring service-specific credentials.",
+            "Federated principals",
+            _federated_grants(grants),
+            "No federated principals.",
+            subtitle="GitHub/GitLab first. Cognito identity-pool roles are app identity, not third-party accounts.",
+            neutral=True,
         )
     )
     parts.append(

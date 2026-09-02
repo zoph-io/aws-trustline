@@ -222,6 +222,56 @@ def statement_has_external_id(condition: dict[str, Any] | None) -> bool:
     return any(k == "sts:externalid" for k in flatten_condition_keys(condition))
 
 
+ORG_BOOTSTRAP_ROLE_NAMES = frozenset(
+    {
+        "OrganizationAccountAccessRole",
+        "AWSControlTowerExecution",
+        "AWSControlTowerAdmin",
+    }
+)
+
+
+def role_name_from_resource(resource: str) -> str:
+    if not resource:
+        return ""
+    return resource.rsplit("/", 1)[-1]
+
+
+def is_org_bootstrap_role(resource: str) -> bool:
+    """AWS-created org/StackSets roles are not confused-deputy leftovers."""
+    name = role_name_from_resource(resource)
+    if name in ORG_BOOTSTRAP_ROLE_NAMES:
+        return True
+    return name.startswith("stacksets-exec-")
+
+
+def should_flag_missing_external_id(
+    *,
+    resource_type: str,
+    mechanism: str,
+    parsed: dict[str, Any],
+    classification: str,
+    resource: str,
+    condition: dict[str, Any] | None,
+) -> bool:
+    """Confused-deputy leftover: untrusted cross-account role trusts without ExternalId.
+
+    Trusted (org/YAML/CloudFront) and AWS org bootstrap roles are not flagged.
+    Vendors still are — that is the Datadog-shaped case.
+    """
+    if resource_type != "AWS::IAM::Role":
+        return False
+    if mechanism not in ("trust_policy", "access_analyzer"):
+        return False
+    if parsed.get("kind") != "aws_account" or parsed.get("is_public"):
+        return False
+    if classification == "trusted":
+        return False
+    if is_org_bootstrap_role(resource):
+        return False
+    return not statement_has_external_id(condition)
+
+
 def oidc_condition_gaps(federated_value: str, condition: dict[str, Any] | None) -> list[str]:
     """Return missing OIDC condition names for GitHub/GitLab trusts.
 
@@ -490,15 +540,15 @@ def grant_from_parsed_principal(
         current_account_id=current_account_id,
     )
     condition = (statement or {}).get("Condition") or {}
-    missing_external_id = False
+    missing_external_id = should_flag_missing_external_id(
+        resource_type=resource_type,
+        mechanism=mechanism,
+        parsed=parsed,
+        classification=classification,
+        resource=resource,
+        condition=condition if isinstance(condition, dict) else {},
+    )
     oidc_gaps: list[str] = []
-    if (
-        resource_type == "AWS::IAM::Role"
-        and mechanism == "trust_policy"
-        and parsed.get("kind") == "aws_account"
-        and not parsed.get("is_public")
-    ):
-        missing_external_id = not statement_has_external_id(condition)
     if parsed.get("kind") == "federated":
         oidc_gaps = oidc_condition_gaps(parsed.get("raw") or "", condition)
 

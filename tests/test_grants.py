@@ -301,6 +301,37 @@ class TrustPolicyGrantTests(unittest.TestCase):
         self.assertFalse(by_acct["222222222222"]["missing_external_id"])
         self.assertEqual(by_acct["222222222222"]["classification"], "trusted")
 
+    def test_trusted_without_external_id_is_not_confused_deputy_leftover(self):
+        policy = {
+            "Statement": {
+                "Effect": "Allow",
+                "Principal": {"AWS": "222222222222"},
+                "Action": "sts:AssumeRole",
+            }
+        }
+        grants = self._grants(policy)
+        self.assertEqual(grants[0]["classification"], "trusted")
+        self.assertFalse(grants[0]["missing_external_id"])
+
+    def test_org_bootstrap_role_skips_external_id_even_if_unknown(self):
+        grants = grants_from_policy_document(
+            {
+                "Statement": {
+                    "Effect": "Allow",
+                    "Principal": {"AWS": "567589703415"},
+                    "Action": "sts:AssumeRole",
+                }
+            },
+            resource="arn:aws:iam::111122223333:role/OrganizationAccountAccessRole",
+            resource_type="AWS::IAM::Role",
+            mechanism="trust_policy",
+            trusted_accounts={},
+            account_to_vendor={},
+            current_account_id="111122223333",
+        )
+        self.assertEqual(grants[0]["classification"], "unknown")
+        self.assertFalse(grants[0]["missing_external_id"])
+
     def test_one_principal_per_grant(self):
         policy = {
             "Statement": {

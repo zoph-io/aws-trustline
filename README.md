@@ -2,7 +2,7 @@
 
 > Map external access grants in your AWS account. Name the vendor when the account is known. Say what you did not scan.
 
-AWS Trustline expands sharing records into **grant rows** (one resource × one principal × one mechanism) and classifies each row against a community-maintained list of [known AWS accounts](https://github.com/fwdcloudsec/known_aws_accounts) from [fwd:cloudsec](https://fwdcloudsec.org/). Unknown leftover is the work list. The report always includes a **coverage banner** so a green summary is not mistaken for “we looked at everything AWS can share.”
+AWS Trustline expands sharing records into **grant rows** (one resource × one principal × one mechanism) and classifies each row against a community-maintained list of [known AWS accounts](https://github.com/fwdcloudsec/known_aws_accounts) from [fwd:cloudsec](https://fwdcloudsec.org/). Unknown leftover is the work list. Coverage of what was **not** scanned lives in an appendix, so a green leftover list is not mistaken for “we looked at everything AWS can share.”
 
 ## Features
 
@@ -13,7 +13,7 @@ AWS Trustline expands sharing records into **grant rows** (one resource × one p
 - **RAM, AMI, SSM, credentials** (both backends unless skipped): Resource Access Manager shares, AMI launch permissions (an `OrganizationArn` is not assumed internal), SSM document shares, and IAM service-specific credentials / long-lived API keys (Bedrock, CloudWatch, CodeCommit, Keyspaces, Claude Platform).
 - **Classification**: _trusted_ (org + YAML + CloudFront OAI/OAC), _known vendor_ (fwd:cloudsec + AWS aliases such as Redshift Support), _federated_ (GitHub Actions OIDC, GitLab, SAML, Cognito), _public_, _unknown_.
 - **Confused deputy**: missing `sts:ExternalId` on cross-account role trusts, and missing `sub`/`aud` on GitHub/GitLab OIDC trusts.
-- **Coverage banner**: every HTML/Markdown report lists what was scanned and what was not (including Lake Formation, Kafka ACLs, and the AA 15-type ceiling). A regional collector that times out is **not scanned**, not a successful empty result.
+- **Coverage appendix**: HTML/Markdown reports end with what was scanned and what was not (including Lake Formation, Kafka ACLs, and the AA 15-type ceiling). A regional collector that times out is **not scanned**, not a successful empty result. Leftover tables come first.
 - **Account or Organization scope** for Access Analyzer: `--scope account` or `--scope organization`.
 - **Multi-region**: `--regions us-east-1,eu-west-1` or `--all-regions` (RAM, AMI, SSM, and AA are regional).
 - **HTML and Markdown reports**: self-contained HTML (no JS) in the [iamtrail.com](https://iamtrail.com) design system. Empty leftover sections are omitted (same as the console).
@@ -31,13 +31,13 @@ flowchart LR
     P --> G["Grant rows"]
     AA --> G
     X --> G
-    G --> R["Classify leftover<br/>+ coverage banner"]
+    G --> R["Leftover first<br/>coverage appendix"]
 ```
 
 1. **Gather reference data**: fwd:cloudsec vendor accounts, AWS Organization members (and org ID), YAML trusted accounts.
 2. **Collect grants** from the selected scanners. Each Allow principal becomes its own row.
 3. **Classify**: trusted / vendor / federated / public / unknown. CloudFront OAI/OAC (`iam::cloudfront:user/…`) is trusted AWS, not leftover. Flag missing ExternalId and OIDC `sub`/`aud`. Flag never-expiring service-specific credentials.
-4. **Report**: console + HTML/Markdown, led by the unknown leftover and a coverage banner.
+4. **Report**: console + HTML/Markdown, led by leftover and KPIs. Coverage is an appendix (collapsed on HTML).
 
 ## Quick Start
 
@@ -286,9 +286,9 @@ GitHub Actions OIDC trusts missing `token.actions.githubusercontent.com:sub` or 
 
 Active IAM service-specific credentials with no expiration (Bedrock / CloudWatch API keys default to this on the CLI) are listed as leftover.
 
-### Coverage banner
+### Coverage appendix
 
-Reports list scanned surfaces and explicitly out-of-scope items (Lake Formation, Kafka ACLs, copies, …). A green summary only covers what was scanned.
+Reports **end** with scanned surfaces and explicitly out-of-scope items (Lake Formation, Kafka ACLs, copies, …). HTML keeps that block collapsed. A green leftover list only covers what was scanned.
 
 ## Choosing a backend
 
@@ -306,7 +306,7 @@ Reports list scanned surfaces and explicitly out-of-scope items (Lake Formation,
 A few things to know about Access Analyzer:
 
 - **`ACTIVE` is not scan-complete.** There is no API field that says the first scan finished. Use `--wait-for-analyzer` (default timeout 300s). First scans can take ~20 minutes.
-- **The 15-type ceiling is printed in the coverage banner.** AA does not cover RAM shares, AMI launch permissions, or SSM document shares; Trustline scans those separately.
+- **The 15-type ceiling is printed in the coverage appendix.** AA does not cover RAM shares, AMI launch permissions, or SSM document shares; Trustline scans those separately.
 - **Lambda aliases/versions and service principals** are AA exclusions and stay in the not-scanned list.
 - **Organization-scope analyzers** treat sibling org accounts as in-zone-of-trust, so they will not show up as AA findings.
 
@@ -324,21 +324,25 @@ Found 480 known AWS accounts in the reference data
 Loading trusted AWS accounts...
 Found 12 accounts in AWS Organization
 
-╭─ What this run looked at ─╮
-│ Scanned: IAM role trust policies, S3 bucket policies, │
-│ RAM resource shares, AMI launch permissions, …        │
-╰───────────────────────────────────────────────────────╯
+╭────────── Public access (1) ──────────╮
+│ bucket-public │ Everyone (*) │ S3 bucket policy │ public │
+╰───────────────────────────────────────╯
 
 ╭────────── AWS Trustline Results ──────────╮
 │ Trusted: 1                                │
 │ Known vendors: 1                          │
 │ Federated: 2                              │
 │ Unknown: 0                                │
-│ Public: 0                                 │
+│ Public: 1                                 │
 │ Missing ExternalId: 1                     │
 │ OIDC missing sub/aud: 0                   │
 │ Never-expiring credentials: 0             │
 ╰───────────────────────────────────────────╯
+
+╭─ Coverage ─╮
+│ Scanned: IAM role trust policies, S3 bucket policies, │
+│ RAM resource shares, AMI launch permissions, …        │
+╰───────────────────────────────────────────────────────╯
 
 Report generated: trustline_report_123456789012_20260901_123045.md
 ```

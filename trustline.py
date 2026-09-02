@@ -801,10 +801,10 @@ def _report_filename(
 
 
 def _coverage_markdown(coverage: dict[str, Any]) -> str:
-    lines = ["## Coverage\n"]
+    lines = ["## Coverage (appendix)\n"]
     lines.append(
-        "This report lists **what was scanned** and **what was not**. "
-        "A green summary only means no leftover grants in the surfaces below.\n"
+        "A green leftover list only covers **scanned** surfaces. "
+        "This section is last on purpose — leftover is the work list.\n"
     )
     backend = coverage.get("backend", "")
     if backend:
@@ -847,7 +847,7 @@ def generate_markdown_report(
     identity_slug: str | None = None,
     identity_label: str | None = None,
 ) -> str:
-    """Write a grant-row Markdown report with a coverage banner."""
+    """Write a grant-row Markdown report (leftover first; coverage appendix last)."""
     current_account_id = (
         list(account_aliases.keys())[0] if account_aliases else "Unknown"
     )
@@ -864,7 +864,6 @@ def generate_markdown_report(
         f.write("# AWS Trustline - Access Analysis Report\n\n")
         f.write(f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"Account/scope: {label}\n\n")
-        f.write(_coverage_markdown(coverage))
         if org_error:
             f.write("## AWS Organizations Access\n\n")
             f.write(f"Could not access AWS Organizations API: {org_error}\n\n")
@@ -935,6 +934,7 @@ def generate_markdown_report(
             _rows(lambda g: g.get("classification") == "trusted"),
             "No trusted-principal grants.",
         )
+        f.write(_coverage_markdown(coverage))
     return report_file
 
 
@@ -953,20 +953,6 @@ def display_grants(
     console.print(
         f"\n[cyan]Analyzing:[/cyan] {current_account_id} ({current_account_alias})\n"
     )
-
-    scanned_bit = ", ".join(item["surface"] for item in (coverage.get("scanned") or [])[:6])
-    console.print(
-        Panel(
-            f"[bold]Coverage[/bold]\n"
-            f"[dim]Scanned:[/dim] {scanned_bit or '—'}\n"
-            f"[dim]Not scanned:[/dim] {len(coverage.get('not_scanned') or [])} surfaces "
-            f"(see report). Analyzer ACTIVE is not scan-complete.",
-            title="What this run looked at",
-            box=box.ROUNDED,
-        )
-    )
-    for note in coverage.get("analyzer_notes") or []:
-        console.print(f"[yellow]{note}[/yellow]")
 
     def _table(title: str, items: list[dict[str, Any]], color: str) -> None:
         if not items:
@@ -1039,6 +1025,18 @@ def display_grants(
             box=box.ROUNDED,
         )
     )
+    scanned_bit = ", ".join(item["surface"] for item in (coverage.get("scanned") or [])[:6])
+    console.print(
+        Panel(
+            f"[dim]Scanned:[/dim] {scanned_bit or '—'}\n"
+            f"[dim]Not scanned:[/dim] {len(coverage.get('not_scanned') or [])} surfaces "
+            f"(see report appendix). Analyzer ACTIVE is not scan-complete.",
+            title="Coverage",
+            box=box.ROUNDED,
+        )
+    )
+    for note in coverage.get("analyzer_notes") or []:
+        console.print(f"[yellow]{note}[/yellow]")
 
 
 def resolve_regions(session: boto3.Session, args: argparse.Namespace) -> list[str]:
@@ -1762,6 +1760,38 @@ tbody tr:hover { background: rgba(39, 39, 42, 0.5); }
   margin-top: 32px;
 }
 .footer a { color: var(--text-muted); }
+details.coverage {
+  margin: 40px 0 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-elev);
+}
+details.coverage > summary {
+  cursor: pointer;
+  list-style: none;
+  padding: 16px 20px;
+  font-family: var(--mono);
+  font-size: 13px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.15em;
+  color: var(--text-muted);
+}
+details.coverage > summary::-webkit-details-marker { display: none; }
+details.coverage > summary::after {
+  content: "Show";
+  float: right;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  color: var(--text-dim);
+}
+details.coverage[open] > summary::after { content: "Hide"; }
+details.coverage[open] > summary {
+  border-bottom: 1px solid var(--border);
+}
+details.coverage .coverage-body { padding: 8px 20px 20px; }
+details.coverage .section { margin: 16px 0 0; }
+details.coverage .callout { margin: 16px 0 0; }
 """
 
 
@@ -1912,6 +1942,8 @@ def _render_coverage_html(coverage: dict[str, Any]) -> str:
         f"<li>{_h(note)}</li>" for note in coverage.get("analyzer_notes") or []
     )
     notes_html = f"<ul>{notes}</ul>" if notes else ""
+    n_scanned = len(coverage.get("scanned") or [])
+    n_skip = len(coverage.get("not_scanned") or [])
     scanned_table = _render_section(
         "Scanned",
         scanned_rows,
@@ -1920,8 +1952,10 @@ def _render_coverage_html(coverage: dict[str, Any]) -> str:
         neutral=True,
     )
     return (
-        '<div class="callout info"><strong>Coverage.</strong> '
-        "A green summary only covers the surfaces listed below. "
+        '<details class="coverage">'
+        f"<summary>Coverage — {n_scanned} scanned, {n_skip} not scanned</summary>"
+        '<div class="coverage-body">'
+        '<div class="callout info"><strong>A green leftover list only covers scanned surfaces.</strong> '
         "Analyzer status ACTIVE is not scan-complete; first scans can take ~20 minutes."
         f"{notes_html}</div>"
         + scanned_table
@@ -1929,8 +1963,9 @@ def _render_coverage_html(coverage: dict[str, Any]) -> str:
             "Not scanned",
             skipped_rows,
             ["Surface", "Why"],
-            subtitle="Out of scope, skipped, or other regions",
+            subtitle="Out of scope, skipped, or collector errors",
         )
+        + "</div></details>"
     )
 
 
@@ -1958,7 +1993,7 @@ def generate_html_report(
     org_error: str | None = None,
     badge: str = "Policy scanner",
 ) -> str:
-    """Write a grant-row HTML report (coverage banner + leftover work lists)."""
+    """Write a grant-row HTML report (leftover first; coverage appendix last)."""
     totals = totals_from_grants(grants)
     current_account_id = (
         list(account_aliases.keys())[0] if account_aliases else "unknown"
@@ -2023,7 +2058,7 @@ def generate_html_report(
             neutral=neutral,
         )
 
-    parts: list[str] = [_render_coverage_html(coverage)]
+    parts: list[str] = []
     if org_error:
         parts.append(
             '<div class="callout"><strong>AWS Organizations:</strong> '
@@ -2089,6 +2124,8 @@ def generate_html_report(
             neutral=True,
         )
     )
+
+    parts.append(_render_coverage_html(coverage))
 
     body_html = hero_html + kpis_html + "\n".join(part for part in parts if part)
     with open(report_file, "w") as fh:

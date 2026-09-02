@@ -8,7 +8,7 @@ alwaysApply: true
 Finish the loop. Do not stop at a code change.
 
 1. **Documentation** — Update README and any user-facing CLI/help text so they match the behavior you just shipped. If classification, flags, coverage, or report shape changed, the docs change in the same pass.
-2. **Pull request** — Update the existing PR for this branch (`gh pr edit`, push). If none exists, create one. Do not open a second PR for the same branch.
+2. **Pull request** — Update the existing PR for this branch (`gh pr edit`, push). If none exists, create one. Do not open a second PR for the same branch. This repo is public: no live-scan leftovers, account IDs, or resource names in the PR text (see `public-repo` rule).
 3. **Review** — Read the diff. Fix bugs, false leftovers, and coverage lies before you call it done. Tests for classification traps belong with the fix.
 4. **Commit and push** — If the work is solid (tests pass, no secrets, no debug leftovers), commit and push without waiting to be asked. Do not commit `reports/`, credentials, or `trusted_accounts.yaml`. Do not force-push `main`/`master`. Do not skip hooks unless the user explicitly asks.
 

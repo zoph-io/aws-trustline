@@ -26,7 +26,7 @@ FOREIGN_ORG_ARN = "arn:aws:organizations::999999999999:organization/o-foreign"
 OUR_ORG_ARN = "arn:aws:organizations::111122223333:organization/o-ours"
 OUR_OU_ARN = "arn:aws:organizations::111122223333:ou/o-ours/ou-abcd1234"
 CLOUDFRONT_OAI_ARN = (
-    "arn:aws:iam::cloudfront:user/CloudFront Origin Access Identity EI92CX6OGEMUI"
+    "arn:aws:iam::cloudfront:user/CloudFront Origin Access Identity EEXAMPLEOAIID"
 )
 CLOUDFRONT_OAC_ARN = (
     "arn:aws:iam::cloudfront:user/CloudFront Origin Access Control E1ABCDEF"
@@ -107,7 +107,7 @@ class CloudFrontPrincipalTests(unittest.TestCase):
         parsed = parse_principal_value("AWS", CLOUDFRONT_OAI_ARN)
         self.assertEqual(parsed["kind"], "cloudfront")
         self.assertIsNone(parsed["account_id"])
-        self.assertEqual(parsed["label"], "CloudFront OAI EI92CX6OGEMUI")
+        self.assertEqual(parsed["label"], "CloudFront OAI EEXAMPLEOAIID")
         classification, vendor, trusted = classify_parsed_principal(
             parsed,
             trusted_accounts={},
@@ -142,7 +142,7 @@ class CloudFrontPrincipalTests(unittest.TestCase):
         )
         self.assertEqual(len(grants), 1)
         self.assertEqual(grants[0]["classification"], "trusted")
-        self.assertEqual(grants[0]["principal_label"], "CloudFront OAI EI92CX6OGEMUI")
+        self.assertEqual(grants[0]["principal_label"], "CloudFront OAI EEXAMPLEOAIID")
         self.assertEqual(totals_from_grants(grants)["unknown"], 0)
         self.assertEqual(totals_from_grants(grants)["trusted"], 1)
 
@@ -318,7 +318,7 @@ class TrustPolicyGrantTests(unittest.TestCase):
             {
                 "Statement": {
                     "Effect": "Allow",
-                    "Principal": {"AWS": "567589703415"},
+                    "Principal": {"AWS": "555555555555"},
                     "Action": "sts:AssumeRole",
                 }
             },

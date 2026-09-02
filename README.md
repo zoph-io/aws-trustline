@@ -11,12 +11,12 @@ AWS Trustline expands sharing records into **grant rows** (one resource × one p
   - **Policy scanner (default)**: reads IAM role trust policies and S3 bucket policies directly. Walks `Principal.AWS`, `Principal.Federated`, and `Principal: "*"`. Never treats the account ID in an OIDC provider ARN as the external party.
   - **Access Analyzer backend (`--use-access-analyzer`)**: consumes findings from AWS IAM Access Analyzer (external access, **free tier**) for the 15 AA-supported types. Analyzer status `ACTIVE` is not scan-complete; pass `--wait-for-analyzer` to poll until finding counts stabilize.
 - **RAM, AMI, SSM, credentials** (both backends unless skipped): Resource Access Manager shares, AMI launch permissions (an `OrganizationArn` is not assumed internal), SSM document shares, and IAM service-specific credentials / long-lived API keys (Bedrock, CloudWatch, CodeCommit, Keyspaces, Claude Platform).
-- **Classification**: _trusted_ (org + YAML), _known vendor_ (fwd:cloudsec + AWS aliases such as Redshift Support), _federated_ (GitHub Actions OIDC, GitLab, SAML, Cognito), _public_, _unknown_.
+- **Classification**: _trusted_ (org + YAML + CloudFront OAI/OAC), _known vendor_ (fwd:cloudsec + AWS aliases such as Redshift Support), _federated_ (GitHub Actions OIDC, GitLab, SAML, Cognito), _public_, _unknown_.
 - **Confused deputy**: missing `sts:ExternalId` on cross-account role trusts, and missing `sub`/`aud` on GitHub/GitLab OIDC trusts.
-- **Coverage banner**: every HTML/Markdown report lists what was scanned and what was not (including Lake Formation, Kafka ACLs, and the AA 15-type ceiling).
+- **Coverage banner**: every HTML/Markdown report lists what was scanned and what was not (including Lake Formation, Kafka ACLs, and the AA 15-type ceiling). A regional collector that times out is **not scanned**, not a successful empty result.
 - **Account or Organization scope** for Access Analyzer: `--scope account` or `--scope organization`.
 - **Multi-region**: `--regions us-east-1,eu-west-1` or `--all-regions` (RAM, AMI, SSM, and AA are regional).
-- **HTML and Markdown reports**: self-contained HTML (no JS) in the [iamtrail.com](https://iamtrail.com) design system.
+- **HTML and Markdown reports**: self-contained HTML (no JS) in the [iamtrail.com](https://iamtrail.com) design system. Empty leftover sections are omitted (same as the console).
 
 ## How It Works
 
@@ -36,7 +36,7 @@ flowchart LR
 
 1. **Gather reference data**: fwd:cloudsec vendor accounts, AWS Organization members (and org ID), YAML trusted accounts.
 2. **Collect grants** from the selected scanners. Each Allow principal becomes its own row.
-3. **Classify**: trusted / vendor / federated / public / unknown. Flag missing ExternalId and OIDC `sub`/`aud`. Flag never-expiring service-specific credentials.
+3. **Classify**: trusted / vendor / federated / public / unknown. CloudFront OAI/OAC (`iam::cloudfront:user/…`) is trusted AWS, not leftover. Flag missing ExternalId and OIDC `sub`/`aud`. Flag never-expiring service-specific credentials.
 4. **Report**: console + HTML/Markdown, led by the unknown leftover and a coverage banner.
 
 ## Quick Start

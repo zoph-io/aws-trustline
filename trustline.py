@@ -426,11 +426,43 @@ def _collect_ram_in_region(
         return region, [], str(e)
 
 
+def _run_regional_collector(
+    session: boto3.Session,
+    regions: list[str],
+    worker: Any,
+    kwargs: dict[str, Any],
+    *,
+    warning_prefix: str,
+) -> tuple[list[dict[str, Any]], list[tuple[str, str]]]:
+    """Fan out a per-region worker. Failures are returned, not swallowed into coverage."""
+    grants: list[dict[str, Any]] = []
+    failures: list[tuple[str, str]] = []
+    if not regions:
+        return grants, failures
+    workers = min(AA_MAX_WORKERS, max(1, len(regions)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [
+            pool.submit(worker, session, region, kwargs) for region in regions
+        ]
+        for future in as_completed(futures):
+            region, region_grants, error = future.result()
+            if error:
+                console.print(
+                    f"[yellow]Warning: {warning_prefix} in {region}: {error}[/yellow]"
+                )
+                failures.append((region, error))
+                continue
+            grants.extend(region_grants)
+    order = {region: i for i, region in enumerate(regions)}
+    failures.sort(key=lambda item: order.get(item[0], 10_000))
+    return grants, failures
+
+
 def collect_ram_grants(
     session: boto3.Session,
     regions: list[str],
     **kwargs: Any,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], list[tuple[str, str]]]:
     """RAM resource shares: join ASSOCIATED principals to ASSOCIATED resources.
 
     Does not use ``list-resources --principal`` (that API ignores the role name).
@@ -439,23 +471,11 @@ def collect_ram_grants(
     console.print(
         f"[bold blue]Checking RAM resource shares in {len(regions)} region(s)...[/bold blue]"
     )
-    grants: list[dict[str, Any]] = []
-    workers = min(AA_MAX_WORKERS, max(1, len(regions)))
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [
-            pool.submit(_collect_ram_in_region, session, region, kwargs)
-            for region in regions
-        ]
-        for future in as_completed(futures):
-            region, region_grants, error = future.result()
-            if error:
-                console.print(
-                    f"[yellow]Warning: RAM in {region}: {error}[/yellow]"
-                )
-                continue
-            grants.extend(region_grants)
+    grants, failures = _run_regional_collector(
+        session, regions, _collect_ram_in_region, kwargs, warning_prefix="RAM"
+    )
     console.print(f"[green]RAM share grants: {len(grants)}[/green]")
-    return grants
+    return grants, failures
 
 
 def _ami_grants_for_image(
@@ -546,26 +566,16 @@ def collect_ami_grants(
     session: boto3.Session,
     regions: list[str],
     **kwargs: Any,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], list[tuple[str, str]]]:
     """AMI launch permissions. OrganizationArn is not assumed internal."""
     console.print(
         f"[bold blue]Checking AMI launch permissions in {len(regions)} region(s)...[/bold blue]"
     )
-    grants: list[dict[str, Any]] = []
-    workers = min(AA_MAX_WORKERS, max(1, len(regions)))
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [
-            pool.submit(_collect_ami_in_region, session, region, kwargs)
-            for region in regions
-        ]
-        for future in as_completed(futures):
-            region, region_grants, error = future.result()
-            if error:
-                console.print(f"[yellow]Warning: AMIs in {region}: {error}[/yellow]")
-                continue
-            grants.extend(region_grants)
+    grants, failures = _run_regional_collector(
+        session, regions, _collect_ami_in_region, kwargs, warning_prefix="AMIs"
+    )
     console.print(f"[green]AMI launch-permission grants: {len(grants)}[/green]")
-    return grants
+    return grants, failures
 
 
 def _collect_ssm_in_region(
@@ -626,26 +636,16 @@ def collect_ssm_document_grants(
     session: boto3.Session,
     regions: list[str],
     **kwargs: Any,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], list[tuple[str, str]]]:
     """SSM document share attributes (account-id lists, including public ``all``)."""
     console.print(
         f"[bold blue]Checking SSM document shares in {len(regions)} region(s)...[/bold blue]"
     )
-    grants: list[dict[str, Any]] = []
-    workers = min(AA_MAX_WORKERS, max(1, len(regions)))
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [
-            pool.submit(_collect_ssm_in_region, session, region, kwargs)
-            for region in regions
-        ]
-        for future in as_completed(futures):
-            region, region_grants, error = future.result()
-            if error:
-                console.print(f"[yellow]Warning: SSM in {region}: {error}[/yellow]")
-                continue
-            grants.extend(region_grants)
+    grants, failures = _run_regional_collector(
+        session, regions, _collect_ssm_in_region, kwargs, warning_prefix="SSM"
+    )
     console.print(f"[green]SSM document share grants: {len(grants)}[/green]")
-    return grants
+    return grants, failures
 
 
 def _list_service_specific_credentials(iam_client: Any) -> list[dict[str, Any]]:
@@ -731,7 +731,6 @@ def collect_optional_scanners(
     grants: list[dict[str, Any]] = []
     scanned: list[dict[str, str]] = []
     skipped: list[dict[str, str]] = []
-    region_detail = ", ".join(regions) if regions else "no region configured"
 
     def _maybe(flag: str, surface: str, runner: Any) -> None:
         if getattr(args, flag):
@@ -745,8 +744,19 @@ def collect_optional_scanners(
                 }
             )
             return
-        grants.extend(runner())
-        scanned.append({"surface": surface, "detail": region_detail})
+        region_grants, failures = runner()
+        grants.extend(region_grants)
+        failed_ids = {region for region, _ in failures}
+        ok_regions = [region for region in regions if region not in failed_ids]
+        if ok_regions:
+            scanned.append({"surface": surface, "detail": ", ".join(ok_regions)})
+        for region, error in failures:
+            skipped.append(
+                {
+                    "surface": f"{surface} ({region})",
+                    "detail": error,
+                }
+            )
 
     _maybe(
         "skip_ram",
@@ -871,11 +881,10 @@ def generate_markdown_report(
             f"- Total grants: {totals['findings']}\n\n"
         )
 
-        def write_grant_table(title: str, items: list[dict[str, Any]], empty: str) -> None:
-            f.write(f"## {title}\n\n")
+        def write_grant_table(title: str, items: list[dict[str, Any]], _empty: str) -> None:
             if not items:
-                f.write(f"{empty}\n\n")
                 return
+            f.write(f"## {title}\n\n")
             f.write("| Resource | Principal | Mechanism | Classification |\n")
             f.write("|----------|-----------|-----------|----------------|\n")
             for g in items:
@@ -1986,7 +1995,7 @@ def generate_html_report(
     )
     kpis_html = (
         '<div class="kpis">'
-        + _render_kpi("Trusted", totals["trusted"], "Org + YAML allow-list")
+        + _render_kpi("Trusted", totals["trusted"], "Org + YAML + CloudFront OAI")
         + _render_kpi("Known vendors", totals["vendors"], "fwd:cloudsec + AWS aliases")
         + _render_kpi("Federated", totals["federated"], "OIDC / SAML / Cognito")
         + _render_kpi("Unknown", totals["unknown"], "Principals to review", danger=totals["unknown"] > 0)
@@ -2003,6 +2012,8 @@ def generate_html_report(
     columns.extend(["Principal", "Classification", "Mechanism", "Actions"])
 
     def section(title: str, items: list[dict[str, Any]], empty: str, *, subtitle: str = "", neutral: bool = False) -> str:
+        if not items:
+            return ""
         return _render_section(
             title,
             _grant_table_rows(items, show_owner=show_owner),
@@ -2079,7 +2090,7 @@ def generate_html_report(
         )
     )
 
-    body_html = hero_html + kpis_html + "\n".join(parts)
+    body_html = hero_html + kpis_html + "\n".join(part for part in parts if part)
     with open(report_file, "w") as fh:
         fh.write(
             _html_document(

@@ -25,6 +25,12 @@ GITLAB_OIDC_ARN = "arn:aws:iam::111122223333:oidc-provider/gitlab.com"
 FOREIGN_ORG_ARN = "arn:aws:organizations::999999999999:organization/o-foreign"
 OUR_ORG_ARN = "arn:aws:organizations::111122223333:organization/o-ours"
 OUR_OU_ARN = "arn:aws:organizations::111122223333:ou/o-ours/ou-abcd1234"
+CLOUDFRONT_OAI_ARN = (
+    "arn:aws:iam::cloudfront:user/CloudFront Origin Access Identity EI92CX6OGEMUI"
+)
+CLOUDFRONT_OAC_ARN = (
+    "arn:aws:iam::cloudfront:user/CloudFront Origin Access Control E1ABCDEF"
+)
 
 
 class ExtractAccountIdTests(unittest.TestCase):
@@ -55,6 +61,9 @@ class ExtractAccountIdTests(unittest.TestCase):
 
     def test_wildcard(self):
         self.assertIsNone(extract_account_id_from_iam_value("*"))
+
+    def test_cloudfront_oai_is_not_an_account_id(self):
+        self.assertIsNone(extract_account_id_from_iam_value(CLOUDFRONT_OAI_ARN))
 
 
 class ParsePrincipalTests(unittest.TestCase):
@@ -91,6 +100,51 @@ class ParsePrincipalTests(unittest.TestCase):
         self.assertEqual(parsed["organization_id"], "o-ours")
         self.assertTrue(parsed["is_our_organization"])
         self.assertIsNone(parsed["account_id"])
+
+
+class CloudFrontPrincipalTests(unittest.TestCase):
+    def test_oai_is_trusted_aws_not_unknown(self):
+        parsed = parse_principal_value("AWS", CLOUDFRONT_OAI_ARN)
+        self.assertEqual(parsed["kind"], "cloudfront")
+        self.assertIsNone(parsed["account_id"])
+        self.assertEqual(parsed["label"], "CloudFront OAI EI92CX6OGEMUI")
+        classification, vendor, trusted = classify_parsed_principal(
+            parsed,
+            trusted_accounts={},
+            account_to_vendor={},
+            current_account_id="111122223333",
+        )
+        self.assertEqual(classification, "trusted")
+        self.assertIsNone(vendor)
+        self.assertEqual(trusted["source"], "aws_cloudfront")
+        self.assertEqual(trusted["name"], "Amazon CloudFront")
+
+    def test_oac_label(self):
+        parsed = parse_principal_value("AWS", CLOUDFRONT_OAC_ARN)
+        self.assertEqual(parsed["kind"], "cloudfront")
+        self.assertEqual(parsed["label"], "CloudFront OAC E1ABCDEF")
+
+    def test_s3_bucket_policy_oai_is_not_leftover(self):
+        grants = grants_from_policy_document(
+            {
+                "Statement": {
+                    "Effect": "Allow",
+                    "Principal": {"AWS": CLOUDFRONT_OAI_ARN},
+                    "Action": "s3:GetObject",
+                }
+            },
+            resource="arn:aws:s3:::asd.zoph.io",
+            resource_type="AWS::S3::Bucket",
+            mechanism="s3_bucket_policy",
+            trusted_accounts={},
+            account_to_vendor={},
+            current_account_id="111122223333",
+        )
+        self.assertEqual(len(grants), 1)
+        self.assertEqual(grants[0]["classification"], "trusted")
+        self.assertEqual(grants[0]["principal_label"], "CloudFront OAI EI92CX6OGEMUI")
+        self.assertEqual(totals_from_grants(grants)["unknown"], 0)
+        self.assertEqual(totals_from_grants(grants)["trusted"], 1)
 
 
 class ClassifyTests(unittest.TestCase):

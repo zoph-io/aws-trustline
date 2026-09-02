@@ -8,6 +8,8 @@ Vendor / org / YAML data classify the row; they are not grouping keys.
 Account IDs found inside federated or Organizations ARNs are *not* treated as
 the external party. The account ID in a GitHub OIDC provider ARN is yours.
 An OrganizationArn on an AMI is not proof the share is internal.
+CloudFront origin access identities use ``iam::cloudfront:user/…`` — that is
+AWS, not an unknown third party.
 """
 
 from __future__ import annotations
@@ -24,6 +26,12 @@ ORGANIZATIONS_ARN_RE = re.compile(
 )
 IAM_ARN_RE = re.compile(
     r"^arn:aws(?:-us-gov|-cn)?:iam::(\d{12}):.+$"
+)
+# S3 bucket policies name CloudFront OAIs/OACs this way. The account slot is
+# the literal "cloudfront", not a 12-digit ID.
+CLOUDFRONT_IAM_USER_RE = re.compile(
+    r"^arn:aws(?:-us-gov|-cn)?:iam::cloudfront:user/(.+)$",
+    re.IGNORECASE,
 )
 GITHUB_OIDC_HOST = "token.actions.githubusercontent.com"
 GITLAB_OIDC_MARKERS = ("gitlab.com", "gitlab.")
@@ -141,6 +149,8 @@ def extract_account_id_from_iam_value(value: str) -> str | None:
         return None
     if ":oidc-provider/" in value or ":saml-provider/" in value:
         return None
+    if ":iam::cloudfront:" in value.lower():
+        return None
     iam_match = IAM_ARN_RE.match(value)
     if iam_match:
         return iam_match.group(1)
@@ -162,6 +172,17 @@ def is_aws_service_principal(value: str) -> bool:
     if lowered.endswith(".amazonaws.com") and not lowered.startswith("arn:"):
         return True
     return False
+
+
+def cloudfront_principal_label(resource_path: str) -> str:
+    """Short label for an ``iam::cloudfront:user/…`` principal."""
+    lowered = resource_path.lower()
+    token = resource_path.rsplit(" ", 1)[-1]
+    if "origin access identity" in lowered:
+        return f"CloudFront OAI {token}"
+    if "origin access control" in lowered:
+        return f"CloudFront OAC {token}"
+    return f"CloudFront {resource_path}"
 
 
 def federated_provider_label(value: str) -> str:
@@ -313,6 +334,14 @@ def parse_principal_value(
         )
         return parsed
 
+    cf_match = CLOUDFRONT_IAM_USER_RE.match(value)
+    if cf_match:
+        parsed.update(
+            kind="cloudfront",
+            label=cloudfront_principal_label(cf_match.group(1)),
+        )
+        return parsed
+
     org_match = ORGANIZATIONS_ARN_RE.match(value)
     if org_match:
         org_or_ou, rest = org_match.group(2), org_match.group(3)
@@ -356,6 +385,11 @@ def classify_parsed_principal(
         return "public", None, None
     if parsed.get("kind") == "federated":
         return "federated", None, None
+    if parsed.get("kind") == "cloudfront":
+        return "trusted", None, {
+            "name": "Amazon CloudFront",
+            "source": "aws_cloudfront",
+        }
     if parsed.get("kind") in ("organization", "ou"):
         if parsed.get("is_our_organization"):
             return "trusted", None, {
@@ -388,6 +422,7 @@ def is_same_account_principal(
         return False
     if parsed.get("is_public") or parsed.get("kind") in (
         "federated",
+        "cloudfront",
         "organization",
         "ou",
         "canonical_user",

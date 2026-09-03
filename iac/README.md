@@ -1,10 +1,11 @@
 # AWS Trustline scheduled scanner (Lambda + EventBridge + S3)
 
-Deploy [AWS Trustline](../README.md) as a scheduled AWS Lambda. Findings from
-IAM Access Analyzer are classified against the
-[fwd:cloudsec](https://github.com/fwdcloudsec/known_aws_accounts) vendor
-dataset, rendered into a timestamped HTML report, uploaded to S3, and
-(optionally) summarized over SNS when anything warrants attention.
+Deploy [AWS Trustline](../README.md) as a scheduled AWS Lambda. Grant rows from
+IAM Access Analyzer (plus RAM / AMI / SSM / credentials) are classified against
+the [fwd:cloudsec](https://github.com/fwdcloudsec/known_aws_accounts) vendor
+dataset. The HTML report leads with leftover, ends with a collapsed coverage
+appendix, is uploaded to S3, and (optionally) summarized over SNS when leftover
+warrants attention.
 
 The Access Analyzer external-access tier is free, so this stack adds no
 analyzer costs. You only pay for Lambda invocations, CloudWatch Logs, S3
@@ -126,7 +127,7 @@ aws s3 ls "s3://$(aws cloudformation describe-stacks \
     --output text)/reports/" --recursive
 ```
 
-A successful invoke returns:
+A successful invoke returns (numbers are placeholders):
 
 ```json
 {
@@ -134,14 +135,24 @@ A successful invoke returns:
   "scope": "organization",
   "regions": ["eu-west-1", "us-east-1"],
   "totals": {
-    "trusted": 10, "vendors": 0, "unknown": 9,
-    "public": 1, "missing_external_id": 6,
-    "findings": 28, "owner_accounts": 3
+    "trusted": 10,
+    "vendors": 0,
+    "federated": 4,
+    "unknown": 1,
+    "public": 1,
+    "missing_external_id": 0,
+    "missing_oidc_subject": 1,
+    "never_expires": 0,
+    "findings": 16,
+    "owner_accounts": 3,
+    "regions": 2
   },
   "report_key": "reports/2026/06/20/trustline_report_org_20260620_104108.html",
   "bucket": "aws-trustline-reportbucket-..."
 }
 ```
+
+SNS alerts when public, unknown, missing ExternalId, OIDC `sub`/`aud` gaps, or never-expiring credentials are non-zero.
 
 ## Update
 
@@ -213,8 +224,8 @@ multipart uploads after 7 days.
 - **Time the scan with a real timezone.** Set `ScheduleTimezone=Europe/Paris`
   and `ScheduleExpression=cron(0 7 * * ? *)` to scan at 07:00 local time
   every day across summer/winter time changes.
-- **Read a report locally.** The HTML report is self-contained (inline CSS,
-  no JS); just download from S3 and open in a browser:
+- **Read a report locally.** The HTML is self-contained (inline CSS, no JS).
+  Leftover tables come first; coverage is a collapsed appendix at the bottom.
 
   ```bash
   aws s3 cp "s3://${BUCKET}/${KEY}" /tmp/trustline.html && open /tmp/trustline.html

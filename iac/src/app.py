@@ -121,6 +121,10 @@ def lambda_handler(event, context):  # noqa: ARG001
         for note in wait_notes:
             logger.info("Analyzer wait: %s", note)
 
+    current_account_id = next(iter(account_aliases), "")
+    restrict_to_owner = (
+        None if scope == "organization" else current_account_id or None
+    )
     report_data = trustline.collect_access_analyzer_findings(
         session=session,
         account_to_vendor=account_to_vendor,
@@ -129,9 +133,9 @@ def lambda_handler(event, context):  # noqa: ARG001
         org_accounts=org_accounts,
         analyzers=analyzers,
         our_organization_id=our_organization_id,
+        restrict_to_owner=restrict_to_owner,
     )
 
-    current_account_id = next(iter(account_aliases), "")
     kwargs = trustline.grant_collect_context(
         account_to_vendor=account_to_vendor,
         trusted_accounts=trusted_accounts,
@@ -160,13 +164,7 @@ def lambda_handler(event, context):  # noqa: ARG001
         analyzer_notes=wait_notes + list(report_data.get("analyzer_notes") or []),
     )
 
-    effective_scope = scope
-    if effective_scope == "auto":
-        effective_scope = (
-            "organization"
-            if any(a["type"] == "ORGANIZATION" for a in analyzers.values())
-            else "account"
-        )
+    effective_scope = trustline.report_scope_label(scope)
 
     output_dir = "/tmp/trustline-reports"
     os.makedirs(output_dir, exist_ok=True)

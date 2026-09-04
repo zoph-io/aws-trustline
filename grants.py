@@ -316,6 +316,206 @@ def oidc_condition_gaps(federated_value: str, condition: dict[str, Any] | None) 
     return gaps
 
 
+def federated_raw_from_grant(grant: dict[str, Any]) -> str:
+    """Federated issuer ARN/URL stored on a grant row."""
+    praw = grant.get("principal_raw") or {}
+    if isinstance(praw, dict):
+        for key in ("Federated", "federated"):
+            if praw.get(key):
+                return str(praw[key])
+        values = [v for v in praw.values() if v]
+        if values:
+            return str(values[0])
+    return str(grant.get("principal") or "")
+
+
+def matching_trust_condition(
+    policy_document: dict[str, Any] | None,
+    *,
+    principal_kind: str,
+    principal_raw: str,
+    principal_account_id: str | None,
+) -> dict[str, Any] | None:
+    """Condition on the Allow statement that matches this principal, if found."""
+    fallback: dict[str, Any] | None = None
+    for stmt, ptype, value in iter_allow_principals(policy_document):
+        cond = stmt.get("Condition") if isinstance(stmt.get("Condition"), dict) else {}
+        if not isinstance(cond, dict):
+            cond = {}
+        if principal_kind == "federated" and ptype == "Federated":
+            if principal_raw and str(value) == principal_raw:
+                return cond
+            if fallback is None:
+                fallback = cond
+        elif principal_kind == "aws_account" and ptype == "AWS":
+            extracted = extract_account_id_from_iam_value(str(value))
+            if principal_account_id and extracted == principal_account_id:
+                return cond
+            if principal_raw and str(value) == principal_raw:
+                return cond
+    return fallback
+
+
+def apply_live_trust_conditions(
+    grant: dict[str, Any],
+    policy_document: dict[str, Any] | None,
+) -> bool:
+    """Recompute OIDC/ExternalId flags from a live AssumeRole policy.
+
+    Access Analyzer findings often omit Condition. Empty AA condition is not
+    proof the role is missing ``sub``/``aud`` or ExternalId.
+    """
+    kind = grant.get("principal_kind") or ""
+    raw = federated_raw_from_grant(grant)
+    cond = matching_trust_condition(
+        policy_document,
+        principal_kind=kind,
+        principal_raw=raw,
+        principal_account_id=grant.get("principal_account_id"),
+    )
+    if cond is None:
+        return False
+    grant["condition"] = cond
+    grant["condition_source"] = "iam_get_role"
+    if kind == "federated":
+        gaps = oidc_condition_gaps(raw, cond)
+        grant["oidc_gaps"] = gaps
+        grant["missing_oidc_subject"] = bool(gaps)
+    grant["missing_external_id"] = should_flag_missing_external_id(
+        resource_type=grant.get("resource_type") or "",
+        mechanism=grant.get("mechanism") or "access_analyzer",
+        parsed={
+            "kind": kind,
+            "is_public": grant.get("is_public"),
+        },
+        classification=grant.get("classification") or "unknown",
+        resource=grant.get("resource") or "",
+        condition=cond,
+    )
+    return True
+
+
+def clear_unproven_aa_condition_flags(grant: dict[str, Any]) -> None:
+    """Do not report leftover flags when AA omitted conditions and we cannot read the role."""
+    grant["missing_oidc_subject"] = False
+    grant["oidc_gaps"] = []
+    grant["missing_external_id"] = False
+    grant["condition_source"] = "access_analyzer_omitted"
+
+
+def choose_external_analyzer(
+    candidates: list[dict[str, Any]],
+    scope: str,
+) -> dict[str, Any] | None:
+    """Pick one analyzer for a region.
+
+    ``auto`` prefers ACCOUNT so the default inventory is this account, not the
+    whole organization zone of trust. ORGANIZATION is used only when no ACCOUNT
+    analyzer exists in that region, or when scope is ``organization``.
+    """
+    if not candidates:
+        return None
+    if scope == "auto":
+        acct = next((c for c in candidates if c.get("type") == "ACCOUNT"), None)
+        if acct is not None:
+            return acct
+        org = next((c for c in candidates if c.get("type") == "ORGANIZATION"), None)
+        return org if org is not None else candidates[0]
+    return candidates[0]
+
+
+def report_scope_label(requested_scope: str) -> str:
+    """Report filename/grouping scope. Org slug only when the operator asked."""
+    return "organization" if requested_scope == "organization" else "account"
+
+
+_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+_RESOURCE_TYPES_NAME_IS_ENOUGH = frozenset({"IAM Role", "IAM User", "S3 Bucket"})
+
+
+def short_resource_name(arn_or_name: str) -> str:
+    """Last path or ARN segment — too lossy alone for UUIDs and SNS names like ``1``."""
+    if not arn_or_name:
+        return ""
+    if "/" in arn_or_name:
+        return arn_or_name.split("/")[-1]
+    if ":" in arn_or_name:
+        return arn_or_name.split(":")[-1]
+    return arn_or_name
+
+
+def compact_aws_resource_type(resource_type: str) -> str:
+    if not resource_type:
+        return ""
+    body = resource_type.replace("AWS::", "")
+    parts = body.split("::")
+    if len(parts) == 2:
+        return f"{parts[0]} {parts[1]}"
+    return body.replace("::", " ")
+
+
+def is_opaque_resource_name(name: str) -> bool:
+    if not name:
+        return True
+    if _UUID_RE.fullmatch(name):
+        return True
+    if name.isdigit() and len(name) <= 8:
+        return True
+    return len(name) <= 2
+
+
+def grant_resource_label(grant: dict[str, Any]) -> str:
+    """Inventory label: resource name plus type when the name alone is unusable."""
+    arn = grant.get("resource") or ""
+    rtype = compact_aws_resource_type(grant.get("resource_type") or "")
+    name = short_resource_name(arn)
+    if not name:
+        return rtype or "—"
+    needs_type = rtype and (
+        is_opaque_resource_name(name) or rtype not in _RESOURCE_TYPES_NAME_IS_ENOUGH
+    )
+    if needs_type:
+        return f"{name} ({rtype})"
+    return name
+
+
+def access_analyzer_grant_dedupe_key(grant: dict[str, Any]) -> tuple[Any, ...]:
+    """Identity of one AA finding for cross-region / mixed-analyzer dedupe."""
+    return (
+        grant.get("resource") or "",
+        grant.get("principal_kind") or "",
+        grant.get("principal_account_id") or "",
+        grant.get("principal_label") or grant.get("principal") or "",
+        bool(grant.get("is_public")),
+    )
+
+
+def dedupe_access_analyzer_grants(
+    grants: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    """IAM roles are global; ACCOUNT + ORGANIZATION analyzers often emit the same finding.
+
+    Prefers ACCOUNT-analyzer rows when both exist.
+    """
+    others = [g for g in grants if g.get("mechanism") != "access_analyzer"]
+    aa = [g for g in grants if g.get("mechanism") == "access_analyzer"]
+    aa.sort(key=lambda g: 0 if g.get("analyzer_type") == "ACCOUNT" else 1)
+    seen: set[tuple[Any, ...]] = set()
+    kept: list[dict[str, Any]] = []
+    dropped = 0
+    for grant in aa:
+        key = access_analyzer_grant_dedupe_key(grant)
+        if key in seen:
+            dropped += 1
+            continue
+        seen.add(key)
+        kept.append(grant)
+    return others + kept, dropped
+
+
 def iter_statements(policy_document: dict[str, Any] | None) -> list[dict[str, Any]]:
     if not policy_document:
         return []
@@ -610,7 +810,7 @@ def party_identity_key(grant: dict[str, Any]) -> str:
     if kind == "federated":
         return f"federated:{label}"
     if kind == "cloudfront":
-        return f"cloudfront:{label}"
+        return "cloudfront:aws"
     org_id = grant.get("organization_id")
     if org_id:
         return f"org:{org_id}"
@@ -637,10 +837,14 @@ def parties_from_grants(grants: Iterable[dict[str, Any]]) -> list[dict[str, Any]
                 for g in items
             )
         )
+        name = first.get("principal_label") or first.get("principal") or ""
+        if first.get("principal_kind") == "cloudfront":
+            trusted = first.get("trusted") or {}
+            name = trusted.get("name") or "Amazon CloudFront"
         parties.append(
             {
                 "key": key,
-                "name": first.get("principal_label") or first.get("principal") or "",
+                "name": name,
                 "account_id": first.get("principal_account_id"),
                 "name_source": first.get("name_source") or "",
                 "name_source_label": NAME_SOURCE_LABELS.get(

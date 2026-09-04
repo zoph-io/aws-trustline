@@ -6,7 +6,7 @@ Trustline collects **grant rows** (one resource × one principal × one mechanis
 
 ## How to read a report
 
-The first table is the **inventory**: one row per external party, with the resolved name and which directory produced it.
+The first table is the **inventory**: one row per external party, with the resolved name and which directory produced it. The Resources column includes the AWS type when the last ARN segment is a UUID, a short digit, or not an IAM role / S3 bucket name.
 
 | Classification | Meaning |
 |---|---|
@@ -106,15 +106,15 @@ flowchart LR
 ```
 
 1. Load vendor IDs (fwd:cloudsec, cached under `~/.cache/aws-trustline/`), Organization members and org ID (if allowed), and YAML trusted accounts.
-2. If an external Access Analyzer exists in the requested regions, use it for IAM/S3-class resources. Otherwise walk IAM trusts and S3 policies. RAM, AMI, SSM, and credentials always run unless skipped.
-3. Classify each grant and **group by principal**. Resolve 12-digit IDs. CloudFront OAI/OAC is trusted AWS. Flag missing ExternalId, GitHub/GitLab `sub`/`aud`, and never-expiring credentials. Policy-scanner public S3 is checked with `GetBucketPolicyStatus`.
+2. If an **ACCOUNT** Access Analyzer exists in the requested regions, use it for IAM/S3-class resources. If only an ORGANIZATION analyzer exists, use it but **keep findings owned by this account** (pass `--scope organization` for the whole org). Otherwise walk IAM trusts and S3 policies. RAM, AMI, SSM, and credentials always run unless skipped.
+3. Classify each grant and **group by principal**. Resolve 12-digit IDs. CloudFront OAI/OAC is trusted AWS (one party). Flag missing ExternalId, GitHub/GitLab `sub`/`aud`, and never-expiring credentials. Policy-scanner public S3 is checked with `GetBucketPolicyStatus`. Access Analyzer leftover flags for IAM roles are taken from the live trust policy (`iam:GetRole`), not from findings that omit Condition.
 4. Print the inventory, then leftover flags. Coverage is an appendix.
 
 Mechanisms: trust policy, S3 bucket policy, RAM share, AMI launch permission, SSM document share, service-specific credential, or Access Analyzer finding.
 
 ## Usage
 
-Default: **use Access Analyzer when one exists** (effective access for AA resource types). If none exists, walk IAM trusts and S3 bucket policies. RAM, AMI, SSM, and service-specific credentials run in both cases unless skipped.
+Default: **use Access Analyzer when one exists** (effective access for AA resource types). `--scope auto` (default) **prefers ACCOUNT analyzers** so the inventory is this account. ORGANIZATION analyzers are used only when no ACCOUNT analyzer exists in that region, and those findings are still limited to this account unless you pass `--scope organization`. If none exists, walk IAM trusts and S3 bucket policies. RAM, AMI, SSM, and service-specific credentials run in both cases unless skipped.
 
 ```bash
 python trustline.py
@@ -140,6 +140,8 @@ Consumes findings from an **existing** external IAM Access Analyzer (free; see [
 
 Analyzer status `ACTIVE` is not scan-complete. Pass `--wait-for-analyzer` when analyzers are used (default 300s; first scans can take ~20 minutes).
 
+`--scope auto` does **not** treat an org analyzer as a whole-org report. Report filenames use the caller account ID unless you pass `--scope organization`.
+
 ```bash
 python trustline.py --use-access-analyzer --scope organization --all-regions
 
@@ -147,7 +149,7 @@ python trustline.py --use-access-analyzer --regions us-east-1,eu-west-1 \
     --scope account --format both --output ./reports
 ```
 
-With `--scope organization`, findings are grouped by `resourceOwnerAccount` using Organizations names.
+With `--scope organization`, findings are grouped by `resourceOwnerAccount` using Organizations names. Organization-scope analyzers treat sibling accounts as in-zone-of-trust, so they will not appear as AA findings.
 
 ### CLI options
 
@@ -167,7 +169,7 @@ With `--scope organization`, findings are grouped by `resourceOwnerAccount` usin
 | `--policy-scanner` | | Walk IAM/S3 policies even if an analyzer exists |
 | `--wait-for-analyzer` | | Poll until ACTIVE finding counts stabilize when analyzers are used |
 | `--wait-timeout` | | Seconds to wait (default: 300) |
-| `--scope` | | `auto` (default), `account`, or `organization` |
+| `--scope` | | `auto` (default: prefer ACCOUNT analyzers; this-account inventory), `account`, or `organization` |
 | `--regions` | | Comma-separated regions for RAM / AMI / SSM / AA |
 | `--all-regions` | | Every enabled region (`ec2:DescribeRegions`) |
 | `--format` | | `html` (AA default), `md` (policy-scanner default), or `both` |
@@ -200,7 +202,7 @@ fwd:cloudsec is fetched from GitHub and cached at `~/.cache/aws-trustline/known_
 
 **Confused deputy (`sts:ExternalId`).** Flagged per grant (per statement), not per role. **Not flagged:** trusted principals (org / YAML / CloudFront) and AWS org bootstrap roles (`OrganizationAccountAccessRole`, `stacksets-exec-*`, `AWSControlTowerExecution`, `AWSControlTowerAdmin`). Vendors without ExternalId still are — that is the Datadog-shaped case.
 
-**OIDC `sub` / `aud`.** GitHub Actions trusts missing `token.actions.githubusercontent.com:sub` or `:aud`, and GitLab trusts missing `sub`, are flagged. The account ID in the OIDC provider ARN is yours, not the external party.
+**OIDC `sub` / `aud`.** GitHub Actions trusts missing `token.actions.githubusercontent.com:sub` or `:aud`, and GitLab trusts missing `sub`, are flagged. The account ID in the OIDC provider ARN is yours, not the external party. On the Access Analyzer path, Trustline calls `iam:GetRole` for roles in this account because Analyzer findings often omit Condition (an empty finding is not a leftover).
 
 **Public access.** `Principal: "*"`, AMI `Group=all`, and SSM `AccountIds=all` become public grants. The policy scanner then calls `GetBucketPolicyStatus` on S3 `Allow *` rows: if Block Public Access currently denies the bucket, that row is **not** current public access (listed separately). Access Analyzer `isPublic` already includes BPA and Deny.
 
@@ -222,7 +224,7 @@ Not scanned (always listed):
 
 The **policy scanner** does not evaluate Deny or most conditions, and does not cover KMS grants, S3 ACLs, or other Access Analyzer resource types. Public S3 `Allow *` is checked with `GetBucketPolicyStatus`.
 
-**Access Analyzer** only reasons about [its documented resource types](https://docs.aws.amazon.com/IAM/latest/UserGuide/access-analyzer-resources.html) (S3, IAM roles, KMS, Lambda, SQS, …). RAM shares, AMI launch permissions, and SSM document shares are outside that ceiling; Trustline scans those separately. Lambda aliases/versions and service principals stay not-scanned. Organization-scope analyzers treat sibling accounts as in-zone-of-trust, so they will not appear as AA findings. The appendix prints the exact type list the tool uses.
+**Access Analyzer** only reasons about [its documented resource types](https://docs.aws.amazon.com/IAM/latest/UserGuide/access-analyzer-resources.html) (S3, IAM roles, KMS, Lambda, SQS, …). RAM shares, AMI launch permissions, and SSM document shares are outside that ceiling; Trustline scans those separately. Lambda aliases/versions and service principals stay not-scanned. Organization-scope analyzers treat sibling accounts as in-zone-of-trust, so they will not appear as AA findings. Duplicate findings for the same IAM role from two analyzers are collapsed. The appendix prints the exact type list the tool uses.
 
 ## Choosing a backend
 
@@ -311,7 +313,8 @@ Add:
       "Action": [
         "access-analyzer:ListAnalyzers",
         "access-analyzer:ListFindings",
-        "access-analyzer:GetFinding"
+        "access-analyzer:GetFinding",
+        "iam:GetRole"
       ],
       "Resource": "*"
     }

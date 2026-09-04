@@ -8,16 +8,22 @@ import unittest
 
 from grants import (
     actions_from_ram_permission,
+    apply_live_trust_conditions,
     apply_s3_effective_public,
+    choose_external_analyzer,
     classify_parsed_principal,
     extract_account_id_from_iam_value,
+    flatten_condition_keys,
+    grant_resource_label,
     grants_from_policy_document,
     index_known_accounts,
     merge_builtin_vendors,
     oidc_condition_gaps,
     parse_principal_value,
     parties_from_grants,
+    report_scope_label,
     totals_from_grants,
+    dedupe_access_analyzer_grants,
 )
 
 
@@ -592,6 +598,173 @@ class NameLookupTests(unittest.TestCase):
         self.assertEqual(indexed["333333333333"]["name"], "Datadog")
         self.assertEqual(indexed["444455556666"]["name"], "Datadog")
         self.assertNotIn("nope", indexed)
+
+    def test_two_cloudfront_oais_are_one_party(self):
+        first = grants_from_policy_document(
+            {
+                "Statement": {
+                    "Effect": "Allow",
+                    "Principal": {"AWS": CLOUDFRONT_OAI_ARN},
+                    "Action": "s3:GetObject",
+                }
+            },
+            resource="arn:aws:s3:::example-a",
+            resource_type="AWS::S3::Bucket",
+            mechanism="s3_bucket_policy",
+            trusted_accounts={},
+            account_to_vendor={},
+            current_account_id="111122223333",
+        )
+        second = grants_from_policy_document(
+            {
+                "Statement": {
+                    "Effect": "Allow",
+                    "Principal": {"AWS": CLOUDFRONT_OAC_ARN},
+                    "Action": "s3:GetObject",
+                }
+            },
+            resource="arn:aws:s3:::example-b",
+            resource_type="AWS::S3::Bucket",
+            mechanism="s3_bucket_policy",
+            trusted_accounts={},
+            account_to_vendor={},
+            current_account_id="111122223333",
+        )
+        parties = parties_from_grants(first + second)
+        self.assertEqual(len(parties), 1)
+        self.assertEqual(parties[0]["name"], "Amazon CloudFront")
+        self.assertEqual(parties[0]["grant_count"], 2)
+        self.assertEqual(parties[0]["classification"], "trusted")
+
+
+class AnalyzerChoiceTests(unittest.TestCase):
+    def test_auto_prefers_account_over_organization(self):
+        chosen = choose_external_analyzer(
+            [
+                {"type": "ORGANIZATION", "arn": "arn:org"},
+                {"type": "ACCOUNT", "arn": "arn:acct"},
+            ],
+            "auto",
+        )
+        self.assertEqual(chosen["type"], "ACCOUNT")
+
+    def test_auto_falls_back_to_organization(self):
+        chosen = choose_external_analyzer(
+            [{"type": "ORGANIZATION", "arn": "arn:org"}],
+            "auto",
+        )
+        self.assertEqual(chosen["type"], "ORGANIZATION")
+
+    def test_report_scope_auto_is_account(self):
+        self.assertEqual(report_scope_label("auto"), "account")
+        self.assertEqual(report_scope_label("organization"), "organization")
+
+
+class ResourceLabelTests(unittest.TestCase):
+    def test_sns_digit_name_includes_type(self):
+        label = grant_resource_label(
+            {
+                "resource": "arn:aws:sns:eu-west-1:111122223333:1",
+                "resource_type": "AWS::SNS::Topic",
+            }
+        )
+        self.assertEqual(label, "1 (SNS Topic)")
+
+    def test_kms_uuid_includes_type(self):
+        label = grant_resource_label(
+            {
+                "resource": (
+                    "arn:aws:kms:eu-west-1:111122223333:key/"
+                    "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+                ),
+                "resource_type": "AWS::KMS::Key",
+            }
+        )
+        self.assertIn("KMS Key", label)
+        self.assertIn("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", label)
+
+    def test_iam_role_name_is_enough(self):
+        label = grant_resource_label(
+            {
+                "resource": "arn:aws:iam::111122223333:role/GhA-Example",
+                "resource_type": "AWS::IAM::Role",
+            }
+        )
+        self.assertEqual(label, "GhA-Example")
+
+
+class OidcConditionShapeTests(unittest.TestCase):
+    def test_aa_flat_condition_keys_count_as_present(self):
+        gaps = oidc_condition_gaps(
+            GITHUB_OIDC_ARN,
+            {
+                "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+                "token.actions.githubusercontent.com:sub": "repo:acme/app:*",
+            },
+        )
+        self.assertEqual(gaps, [])
+        keys = flatten_condition_keys(
+            {
+                "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+                "token.actions.githubusercontent.com:sub": "repo:acme/app:*",
+            }
+        )
+        self.assertIn("token.actions.githubusercontent.com:sub", keys)
+
+    def test_empty_aa_condition_is_not_kept_when_live_policy_has_sub_aud(self):
+        grants = grants_from_policy_document(
+            {
+                "Statement": {
+                    "Effect": "Allow",
+                    "Principal": {"Federated": GITHUB_OIDC_ARN},
+                    "Action": "sts:AssumeRole",
+                }
+            },
+            resource="arn:aws:iam::111122223333:role/GhA-Example",
+            resource_type="AWS::IAM::Role",
+            mechanism="access_analyzer",
+            trusted_accounts={},
+            account_to_vendor={},
+            current_account_id="111122223333",
+        )
+        self.assertTrue(grants[0]["missing_oidc_subject"])
+        live = {
+            "Statement": {
+                "Effect": "Allow",
+                "Principal": {"Federated": GITHUB_OIDC_ARN},
+                "Action": "sts:AssumeRole",
+                "Condition": {
+                    "StringEquals": {
+                        "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+                    },
+                    "StringLike": {
+                        "token.actions.githubusercontent.com:sub": "repo:acme/app:*"
+                    },
+                },
+            }
+        }
+        self.assertTrue(apply_live_trust_conditions(grants[0], live))
+        self.assertFalse(grants[0]["missing_oidc_subject"])
+        self.assertEqual(grants[0]["oidc_gaps"], [])
+        self.assertEqual(grants[0]["condition_source"], "iam_get_role")
+
+
+class DedupeAccessAnalyzerTests(unittest.TestCase):
+    def test_prefers_account_analyzer_and_drops_duplicate_iam_role(self):
+        base = {
+            "resource": "arn:aws:iam::111122223333:role/GhA-Example",
+            "principal_kind": "federated",
+            "principal_account_id": None,
+            "principal_label": "GitHub Actions OIDC",
+            "is_public": False,
+            "mechanism": "access_analyzer",
+        }
+        org_row = {**base, "analyzer_type": "ORGANIZATION", "id": "org"}
+        acct_row = {**base, "analyzer_type": "ACCOUNT", "id": "acct"}
+        kept, dropped = dedupe_access_analyzer_grants([org_row, acct_row])
+        self.assertEqual(dropped, 1)
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(kept[0]["analyzer_type"], "ACCOUNT")
 
 
 if __name__ == "__main__":

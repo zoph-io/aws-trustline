@@ -17,7 +17,8 @@ Parameters:
       Access Analyzer scope. 'account' uses ACCOUNT analyzers (this account
       only); 'organization' uses ORGANIZATION analyzers (must be deployed in
       the org management or AA delegated-admin account); 'auto' prefers an
-      ORGANIZATION analyzer when present.
+      ACCOUNT analyzer when present (this-account inventory). ORGANIZATION is
+      used only when no ACCOUNT analyzer exists in that region.
 
   Regions:
     Type: String
@@ -186,6 +187,7 @@ Resources:
               Action:
                 - sts:GetCallerIdentity
                 - iam:ListAccountAliases
+                - iam:GetRole
                 - iam:ListServiceSpecificCredentials
                 - ec2:DescribeRegions
                 - ec2:DescribeImages

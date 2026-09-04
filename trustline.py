@@ -29,6 +29,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Any
+from urllib.parse import unquote
 
 import boto3
 import requests
@@ -44,10 +45,16 @@ from grants import (
     MECHANISM_LABELS,
     SERVICE_SPECIFIC_CREDENTIAL_SERVICES,
     actions_from_ram_permission,
+    apply_live_trust_conditions,
     apply_s3_effective_public,
     build_coverage,
+    choose_external_analyzer,
+    clear_unproven_aa_condition_flags,
+    dedupe_access_analyzer_grants,
     empty_grant,
+    flatten_condition_keys,
     grant_from_parsed_principal,
+    grant_resource_label,
     grants_from_policy_document,
     index_known_accounts,
     is_aws_service_principal,
@@ -55,11 +62,13 @@ from grants import (
     oidc_condition_gaps,
     parse_principal_value,
     parties_from_grants,
+    report_scope_label,
+    role_name_from_resource,
     should_flag_missing_external_id,
     totals_from_grants,
 )
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 REFERENCE_DATA_URL = (
     "https://raw.githubusercontent.com/fwdcloudsec/known_aws_accounts/main/accounts.yaml"
@@ -382,6 +391,11 @@ def collect_s3_bucket_grants(
             )
             if any(g.get("is_public") for g in bucket_grants):
                 effectively_public = _bucket_is_effectively_public(s3_client, bucket_name)
+                if effectively_public is None:
+                    console.print(
+                        f"[yellow]Warning: GetBucketPolicyStatus failed for "
+                        f"{bucket_name}; treating Allow * as currently public[/yellow]"
+                    )
                 for grant in bucket_grants:
                     apply_s3_effective_public(grant, effectively_public)
             grants.extend(bucket_grants)
@@ -892,11 +906,15 @@ def _coverage_markdown(coverage: dict[str, Any]) -> str:
 
 
 def _grant_resource_name(grant: dict[str, Any]) -> str:
-    return _short_resource(grant.get("resource") or "")
+    return grant_resource_label(grant)
 
 
 def _party_resource_summary(party: dict[str, Any], *, limit: int = 6) -> str:
-    names = [_short_resource(r) for r in (party.get("resources") or []) if r]
+    items = party.get("grants") or []
+    if items:
+        names = [grant_resource_label(g) for g in items]
+    else:
+        names = [grant_resource_label({"resource": r}) for r in (party.get("resources") or []) if r]
     if len(names) > limit:
         return ", ".join(names[:limit]) + f" +{len(names) - limit} more"
     return ", ".join(names) or "—"
@@ -1113,17 +1131,21 @@ def display_grants(
         )
     )
     scanned_bit = ", ".join(item["surface"] for item in (coverage.get("scanned") or [])[:6])
+    aa_note = ""
+    if coverage.get("backend") == "access_analyzer":
+        aa_note = " Analyzer ACTIVE is not scan-complete."
     console.print(
         Panel(
             f"[dim]Scanned:[/dim] {scanned_bit or '—'}\n"
             f"[dim]Not scanned:[/dim] {len(coverage.get('not_scanned') or [])} surfaces "
-            f"(see report appendix). Analyzer ACTIVE is not scan-complete.",
+            f"(see report appendix).{aa_note}",
             title="Coverage",
             box=box.ROUNDED,
         )
     )
-    for note in coverage.get("analyzer_notes") or []:
-        console.print(f"[yellow]{note}[/yellow]")
+    if coverage.get("backend") != "access_analyzer":
+        for note in coverage.get("analyzer_notes") or []:
+            console.print(f"[yellow]{note}[/yellow]")
 
 
 def resolve_regions(session: boto3.Session, args: argparse.Namespace) -> list[str]:
@@ -1211,8 +1233,9 @@ def find_external_analyzers(
 
     - ``account`` keeps only analyzers of type ``ACCOUNT``.
     - ``organization`` keeps only analyzers of type ``ORGANIZATION``.
-    - ``auto`` keeps both but prefers ``ORGANIZATION`` per region when both
-      exist (org coverage is a superset of account coverage).
+    - ``auto`` keeps both but prefers ``ACCOUNT`` per region (this-account
+      inventory). ORGANIZATION is used only when no ACCOUNT analyzer exists
+      in that region.
 
     Returns a ``{region: {"arn": ..., "type": ..., "name": ...}}`` mapping.
     Regions with no matching analyzer are omitted; the caller is expected to
@@ -1250,14 +1273,9 @@ def find_external_analyzers(
             if not candidates:
                 continue
 
-            if scope == "auto":
-                org = next(
-                    (c for c in candidates if c["type"] == "ORGANIZATION"), None
-                )
-                chosen = org if org is not None else candidates[0]
-            else:
-                chosen = candidates[0]
-
+            chosen = choose_external_analyzer(candidates, scope)
+            if chosen is None:
+                continue
             discovered[region] = chosen
 
     return discovered
@@ -1369,6 +1387,73 @@ def wait_for_analyzer_findings(
     return notes
 
 
+def _assume_role_policy_document(iam_client: Any, role_name: str) -> dict[str, Any] | None:
+    """Live AssumeRolePolicyDocument, or None if GetRole fails."""
+    try:
+        role = iam_client.get_role(RoleName=role_name)
+        doc = (role.get("Role") or {}).get("AssumeRolePolicyDocument")
+        if isinstance(doc, str):
+            return json.loads(unquote(doc))
+        if isinstance(doc, dict):
+            return doc
+    except (ClientError, BotoCoreError, json.JSONDecodeError, TypeError, ValueError):
+        return None
+    return None
+
+
+def enrich_aa_iam_role_conditions(
+    session: boto3.Session,
+    grants: list[dict[str, Any]],
+    current_account_id: str,
+) -> list[str]:
+    """Replace AA leftover flags with live trust-policy conditions when possible.
+
+    Access Analyzer often omits Condition. Empty condition is not proof the
+    role is missing sub/aud or ExternalId.
+    """
+    notes: list[str] = []
+    skipped = 0
+    iam = session.client("iam")
+    cache: dict[str, dict[str, Any] | None] = {}
+    for grant in grants:
+        if grant.get("resource_type") != "AWS::IAM::Role":
+            continue
+        if grant.get("mechanism") != "access_analyzer":
+            continue
+        owner = grant.get("resource_owner") or grant.get("owner_account") or ""
+        other_account = bool(
+            current_account_id and owner and owner != current_account_id
+        )
+        aa_empty = not flatten_condition_keys(grant.get("condition"))
+        if other_account:
+            if aa_empty:
+                clear_unproven_aa_condition_flags(grant)
+                skipped += 1
+            continue
+        role_name = role_name_from_resource(grant.get("resource") or "")
+        if not role_name:
+            if aa_empty:
+                clear_unproven_aa_condition_flags(grant)
+                skipped += 1
+            continue
+        if role_name not in cache:
+            cache[role_name] = _assume_role_policy_document(iam, role_name)
+        doc = cache[role_name]
+        if not doc:
+            if aa_empty:
+                clear_unproven_aa_condition_flags(grant)
+                skipped += 1
+            continue
+        apply_live_trust_conditions(grant, doc)
+    if skipped:
+        notes.append(
+            f"OIDC/ExternalId flags omitted for {skipped} Access Analyzer IAM role "
+            "finding(s) with no conditions (other-account resource or GetRole "
+            "failed). Those flags are not proven leftovers."
+        )
+    return notes
+
+
 def _list_findings_in_region(
     session: boto3.Session,
     region: str,
@@ -1379,8 +1464,13 @@ def _list_findings_in_region(
     account_aliases: dict[str, str],
     org_accounts: dict[str, dict[str, Any]],
     our_organization_id: str | None = None,
-) -> tuple[str, list[dict[str, Any]] | None, str | None]:
-    """Worker for parallel finding collection. Returns (region, findings, error)."""
+    restrict_to_owner: str | None = None,
+) -> tuple[str, list[dict[str, Any]] | None, str | None, int]:
+    """Worker for parallel finding collection.
+
+    Returns (region, findings, error, dropped_other_owner_count).
+    """
+    dropped = 0
     try:
         client = session.client(
             "accessanalyzer", region_name=region, config=AA_CLIENT_CONFIG
@@ -1392,6 +1482,10 @@ def _list_findings_in_region(
             filter={"status": {"eq": ["ACTIVE"]}},
         ):
             for raw in page.get("findings", []):
+                owner = raw.get("resourceOwnerAccount") or ""
+                if restrict_to_owner and owner and owner != restrict_to_owner:
+                    dropped += 1
+                    continue
                 grant = _classify_aa_finding(
                     raw,
                     region=region,
@@ -1404,11 +1498,11 @@ def _list_findings_in_region(
                 )
                 if grant:
                     out.append(grant)
-        return region, out, None
+        return region, out, None, dropped
     except ClientError as e:
-        return region, None, e.response["Error"]["Message"]
+        return region, None, e.response["Error"]["Message"], dropped
     except (BotoCoreError, Exception) as e:
-        return region, None, str(e)
+        return region, None, str(e), dropped
 
 
 def collect_access_analyzer_findings(
@@ -1419,20 +1513,20 @@ def collect_access_analyzer_findings(
     org_accounts: dict[str, dict[str, Any]],
     analyzers: dict[str, dict[str, str]],
     our_organization_id: str | None = None,
+    restrict_to_owner: str | None = None,
 ) -> dict[str, Any]:
     """Collect and classify findings from one or more external analyzers.
 
     Each finding is a grant row classified as trusted, vendor, unknown,
     public, or federated. IAM roles missing ``sts:ExternalId`` and GitHub/GitLab
-    OIDC trusts missing ``sub``/``aud`` are flagged on the row.
+    OIDC trusts missing ``sub``/``aud`` are flagged on the row after reading
+    the live trust policy when GetRole is allowed.
+
+    ``restrict_to_owner`` drops ORGANIZATION-analyzer findings owned by other
+    accounts so a default account-scope scan is not an org dump.
     """
-    findings_by_type: dict[str, list[dict[str, Any]]] = {}
-    missing_external_id: list[dict[str, Any]] = []
-    missing_oidc: list[dict[str, Any]] = []
-    public_findings: list[dict[str, Any]] = []
     grants: list[dict[str, Any]] = []
-    analyzed_ats: list[str] = []
-    seen_owners: set[str] = set()
+    dropped_other_owners = 0
 
     console.print(
         f"[bold blue]Collecting findings from {len(analyzers)} analyzer(s) "
@@ -1452,11 +1546,13 @@ def collect_access_analyzer_findings(
                 account_aliases=account_aliases,
                 org_accounts=org_accounts,
                 our_organization_id=our_organization_id,
+                restrict_to_owner=restrict_to_owner,
             ): region
             for region, analyzer in analyzers.items()
         }
         for future in as_completed(futures):
-            region, findings, error = future.result()
+            region, findings, error, dropped = future.result()
+            dropped_other_owners += dropped
             if error is not None:
                 console.print(
                     f"[yellow]Warning: Could not list findings in {region}: "
@@ -1465,33 +1561,61 @@ def collect_access_analyzer_findings(
                 continue
             for finding in findings or []:
                 grants.append(finding)
-                if finding.get("analyzed_at"):
-                    analyzed_ats.append(str(finding["analyzed_at"]))
-                if finding.get("is_public") or finding.get("classification") == "public":
-                    public_findings.append(finding)
-                if finding.get("missing_external_id"):
-                    missing_external_id.append(finding)
-                if finding.get("missing_oidc_subject"):
-                    missing_oidc.append(finding)
-                if finding.get("owner_account") or finding.get("resource_owner"):
-                    seen_owners.add(
-                        finding.get("owner_account") or finding.get("resource_owner")
-                    )
-                findings_by_type.setdefault(
-                    finding["resource_type"], []
-                ).append(finding)
+
+    before = len(grants)
+    grants, dupes = dedupe_access_analyzer_grants(grants)
+    findings_by_type = {}
+    public_findings = []
+    seen_owners = set()
+    analyzed_ats = []
+    for finding in grants:
+        if finding.get("analyzed_at"):
+            analyzed_ats.append(str(finding["analyzed_at"]))
+        if finding.get("is_public") or finding.get("classification") == "public":
+            public_findings.append(finding)
+        if finding.get("owner_account") or finding.get("resource_owner"):
+            seen_owners.add(
+                finding.get("owner_account") or finding.get("resource_owner")
+            )
+        findings_by_type.setdefault(finding["resource_type"], []).append(finding)
+
+    current_account_id = restrict_to_owner or next(iter(account_aliases), "")
+    analyzer_notes = enrich_aa_iam_role_conditions(
+        session, grants, current_account_id
+    )
+    if dupes:
+        analyzer_notes.append(
+            f"Removed {dupes} duplicate Access Analyzer finding(s) for the same "
+            "resource and principal (IAM is global; ACCOUNT + ORGANIZATION "
+            f"analyzers overlapped). {before} raw findings, {len(grants)} unique."
+        )
+    # Recompute leftover lists after GetRole enrichment.
+    missing_external_id = [g for g in grants if g.get("missing_external_id")]
+    missing_oidc = [g for g in grants if g.get("missing_oidc_subject")]
 
     totals = totals_from_grants(grants)
     totals["regions"] = len(analyzers)
     totals["owner_accounts"] = len(seen_owners)
 
-    analyzer_notes: list[str] = []
     if analyzed_ats:
         analyzer_notes.append(f"Newest finding analyzedAt: {max(analyzed_ats)}")
     else:
         analyzer_notes.append(
             "No analyzedAt timestamps on findings. If analyzers were just created, "
             "ACTIVE does not mean the first scan has finished (~20 minutes)."
+        )
+    if dropped_other_owners:
+        analyzer_notes.append(
+            f"Dropped {dropped_other_owners} ORGANIZATION-analyzer finding(s) "
+            "owned by other accounts (default inventory is this account; pass "
+            "--scope organization for the whole org)."
+        )
+    if any(a.get("type") == "ORGANIZATION" for a in analyzers.values()) and restrict_to_owner:
+        analyzer_notes.append(
+            "An ORGANIZATION analyzer was used in at least one region. Sibling "
+            "accounts are in that analyzer's zone of trust and will not appear "
+            "as external findings there. Prefer an ACCOUNT analyzer per region "
+            "for a this-account inventory."
         )
 
     return {
@@ -1504,6 +1628,7 @@ def collect_access_analyzer_findings(
         "owner_accounts": sorted(seen_owners),
         "grants": grants,
         "analyzer_notes": analyzer_notes,
+        "dropped_other_owners": dropped_other_owners,
     }
 
 
@@ -1623,17 +1748,6 @@ def display_aa_results(report_data: dict[str, Any], coverage: dict[str, Any] | N
         )
     for note in (coverage or {}).get("analyzer_notes") or report_data.get("analyzer_notes") or []:
         console.print(f"[yellow]{note}[/yellow]")
-
-
-def _short_resource(arn_or_name: str) -> str:
-    """Trim an ARN to its last path segment for compact console rendering."""
-    if not arn_or_name:
-        return ""
-    if "/" in arn_or_name:
-        return arn_or_name.split("/")[-1]
-    if ":" in arn_or_name:
-        return arn_or_name.split(":")[-1]
-    return arn_or_name
 
 
 # ---------------------------------------------------------------------------
@@ -1941,10 +2055,14 @@ def _html_principal_cell(finding: dict[str, Any]) -> str:
 def _html_resource_cell(finding: dict[str, Any]) -> str:
     arn = finding.get("resource", "")
     region = finding.get("region", "")
+    label = grant_resource_label(finding)
+    rtype = finding.get("resource_type") or ""
+    type_line = " ".join(p for p in (rtype, region) if p)
     return (
         '<div class="resource-cell">'
-        f'<div class="arn">{_h(arn) or "-"}</div>'
-        f'<div class="region">{_h(region)}</div>'
+        f'<div class="arn">{_h(label) or "-"}</div>'
+        f'<div class="region">{_h(type_line)}</div>'
+        f'<div class="region">{_h(arn)}</div>'
         "</div>"
     )
 
@@ -2050,12 +2168,18 @@ def _render_coverage_html(coverage: dict[str, Any]) -> str:
         empty_message="Nothing was scanned.",
         neutral=True,
     )
+    aa_blurb = ""
+    if coverage.get("backend") == "access_analyzer":
+        aa_blurb = (
+            " Analyzer status ACTIVE is not scan-complete; first scans can take "
+            "~20 minutes."
+        )
     return (
         '<details class="coverage">'
         f"<summary>Coverage — {n_scanned} scanned, {n_skip} not scanned</summary>"
         '<div class="coverage-body">'
-        '<div class="callout info"><strong>The inventory only covers scanned surfaces.</strong> '
-        "Analyzer status ACTIVE is not scan-complete; first scans can take ~20 minutes."
+        '<div class="callout info"><strong>The inventory only covers scanned surfaces.</strong>'
+        f"{aa_blurb}"
         f"{notes_html}</div>"
         + scanned_table
         + _render_section(
@@ -2339,8 +2463,10 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["auto", "account", "organization"],
         default="auto",
         help=(
-            "Access Analyzer scope: 'account', 'organization' (run from the org "
-            "management or AA delegated-admin account), or 'auto' (default)"
+            "Access Analyzer scope: 'account' (this account), 'organization' "
+            "(run from the org management or AA delegated-admin account), or "
+            "'auto' (default: prefer ACCOUNT analyzers so the inventory is this "
+            "account; ORGANIZATION only if no ACCOUNT analyzer exists)"
         ),
     )
     region_group = parser.add_mutually_exclusive_group()
@@ -2468,6 +2594,10 @@ def _run_access_analyzer_backend(
             session, analyzers, timeout=max(1, args.wait_timeout)
         )
 
+    current_account_id = next(iter(account_aliases), "")
+    restrict_to_owner = (
+        None if args.scope == "organization" else current_account_id or None
+    )
     report_data = collect_access_analyzer_findings(
         session=session,
         account_to_vendor=account_to_vendor,
@@ -2476,12 +2606,12 @@ def _run_access_analyzer_backend(
         org_accounts=org_accounts,
         analyzers=analyzers,
         our_organization_id=our_organization_id,
+        restrict_to_owner=restrict_to_owner,
     )
     report_data["analyzer_notes"] = (
         wait_notes + list(report_data.get("analyzer_notes") or [])
     )
 
-    current_account_id = next(iter(account_aliases), "")
     kwargs = grant_collect_context(
         account_to_vendor=account_to_vendor,
         trusted_accounts=trusted_accounts,
@@ -2513,13 +2643,7 @@ def _run_access_analyzer_backend(
     display_aa_results(report_data, coverage)
     display_grants(grants, coverage, account_aliases)
 
-    effective_scope = args.scope
-    if effective_scope == "auto":
-        effective_scope = (
-            "organization"
-            if any(a["type"] == "ORGANIZATION" for a in analyzers.values())
-            else "account"
-        )
+    effective_scope = report_scope_label(args.scope)
     _write_reports(
         grants,
         coverage,

@@ -98,7 +98,7 @@ deployment with daily scans at 06:00 UTC and no SNS alerting.
 
 | Parameter | Default | What it controls |
 |---|---|---|
-| `Scope` | `auto` | `auto` (prefers ORGANIZATION if present), `account`, or `organization` |
+| `Scope` | `auto` | `auto` (prefers ACCOUNT if present), `account`, or `organization` |
 | `Regions` | `all` | `all` (enumerate via `ec2:DescribeRegions`) or comma list `us-east-1,eu-west-1` |
 | `ScheduleExpression` | `cron(0 6 * * ? *)` | EventBridge cron or rate expression |
 | `ScheduleTimezone` | `UTC` | IANA timezone (e.g. `Europe/Paris`) |

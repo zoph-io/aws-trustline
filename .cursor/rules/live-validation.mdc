@@ -1,0 +1,10 @@
+---
+description: Live validation uses aws-vault named profiles; never commit scan output.
+alwaysApply: true
+---
+
+# Live validation
+
+When asked to run Trustline against real AWS accounts, use `aws-vault exec` with the operator’s named profiles (the ones they last named in chat). Do not store those profile names, account IDs, or leftover in git, PRs, or this rule file.
+
+Bring SecurityAgent to the front if vault hangs on macOS keychain. Write reports under `reports/` (gitignored). Evaluate locally; ship code fixes, not scan artifacts.

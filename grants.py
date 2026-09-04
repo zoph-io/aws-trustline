@@ -63,6 +63,10 @@ OUT_OF_SCOPE_SURFACES: tuple[tuple[str, str], ...] = (
         "Internal security plugin, not the domain access policy",
     ),
     (
+        "OpenSearch Serverless data access policies",
+        "Collection-level data access, not a domain resource policy",
+    ),
+    (
         "PrivateLink allowed principals",
         "VPC endpoint service configuration, not a resource policy",
     ),
@@ -128,6 +132,8 @@ MECHANISM_LABELS: dict[str, str] = {
     "lambda_layer_policy": "Lambda layer permission",
     "kms_grant": "KMS cryptographic grant",
     "eventbridge_bus_policy": "EventBridge bus policy",
+    "glue_catalog_policy": "Glue Data Catalog resource policy",
+    "opensearch_domain_policy": "OpenSearch domain access policy",
 }
 
 # Where a principal's display name came from. Reports print these labels.
@@ -1273,8 +1279,8 @@ def build_coverage(
                 "surface": f"IAM Access Analyzer ceiling ({len(AA_SUPPORTED_TYPES)} resource types)",
                 "detail": (
                     "AA does not cover RAM shares, AMI launch permissions, "
-                    "SSM document shares, EventBridge bus policies, Lambda "
-                    "aliases/versions, or service principals"
+                    "SSM document shares, EventBridge/Glue/OpenSearch resource "
+                    "policies, Lambda aliases/versions, or service principals"
                 ),
             },
         )

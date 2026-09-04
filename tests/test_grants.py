@@ -1021,5 +1021,44 @@ class InventoryPresentationTests(unittest.TestCase):
         self.assertIn("kpi-filter", html)
 
 
+class JsonReportTests(unittest.TestCase):
+    def test_json_report_exposes_parties_and_grants(self):
+        import json
+        import tempfile
+
+        from trustline import generate_json_report
+
+        grants = grants_from_policy_document(
+            {
+                "Statement": {
+                    "Effect": "Allow",
+                    "Principal": {"AWS": "444455556666"},
+                    "Action": "glue:GetDatabase",
+                }
+            },
+            resource="arn:aws:glue:eu-west-1:111122223333:catalog",
+            resource_type="AWS::Glue::DataCatalog",
+            mechanism="glue_catalog_policy",
+            trusted_accounts={},
+            account_to_vendor={},
+            current_account_id="111122223333",
+        )
+        coverage = {"scanned": [], "not_scanned": [], "backend": "policy_scanner"}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = generate_json_report(
+                grants,
+                coverage,
+                account_aliases={"111122223333": "example"},
+                output_dir=tmp,
+            )
+            with open(path, encoding="utf-8") as fh:
+                payload = json.load(fh)
+        self.assertEqual(payload["tool"], "aws-trustline")
+        self.assertEqual(payload["totals"]["parties"]["unknown"], 1)
+        self.assertEqual(payload["parties"][0]["classification"], "unknown")
+        self.assertEqual(payload["grants"][0]["mechanism"], "glue_catalog_policy")
+        self.assertIn("444455556666", payload["parties"][0]["name"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -70,7 +70,7 @@ from grants import (
     totals_from_grants,
 )
 
-__version__ = "0.4.4"
+__version__ = "0.4.5"
 
 REFERENCE_DATA_URL = (
     "https://raw.githubusercontent.com/fwdcloudsec/known_aws_accounts/main/accounts.yaml"
@@ -790,9 +790,76 @@ def _collect_eventbridge_in_region(
         return region, [], str(e)
 
 
+def _collect_glue_in_region(
+    session: boto3.Session, region: str, kwargs: dict[str, Any]
+) -> tuple[str, list[dict[str, Any]], str | None]:
+    grants: list[dict[str, Any]] = []
+    try:
+        client = session.client("glue", region_name=region, config=AA_CLIENT_CONFIG)
+        try:
+            raw = client.get_resource_policy().get("PolicyInJson")
+        except ClientError as e:
+            code = (e.response.get("Error") or {}).get("Code") or ""
+            if code in ("EntityNotFoundException", "EntityNotFound"):
+                return region, [], None
+            return region, [], e.response["Error"]["Message"]
+        account = kwargs.get("current_account_id") or ""
+        arn = f"arn:aws:glue:{region}:{account}:catalog"
+        grants.extend(
+            _grants_from_resource_policy(
+                loads_policy_document(raw),
+                resource=arn,
+                resource_type="AWS::Glue::DataCatalog",
+                mechanism="glue_catalog_policy",
+                region=region,
+                kwargs=kwargs,
+            )
+        )
+        return region, grants, None
+    except ClientError as e:
+        return region, [], e.response["Error"]["Message"]
+    except (BotoCoreError, Exception) as e:
+        return region, [], str(e)
+
+
+def _collect_opensearch_in_region(
+    session: boto3.Session, region: str, kwargs: dict[str, Any]
+) -> tuple[str, list[dict[str, Any]], str | None]:
+    grants: list[dict[str, Any]] = []
+    try:
+        client = session.client("opensearch", region_name=region, config=AA_CLIENT_CONFIG)
+        names = client.list_domain_names().get("DomainNames") or []
+        for item in names:
+            name = item.get("DomainName") if isinstance(item, dict) else str(item or "")
+            if not name:
+                continue
+            try:
+                domain = client.describe_domain(DomainName=name).get("DomainStatus") or {}
+            except ClientError:
+                continue
+            arn = domain.get("ARN") or name
+            grants.extend(
+                _grants_from_resource_policy(
+                    loads_policy_document(domain.get("AccessPolicies")),
+                    resource=arn,
+                    resource_type="AWS::OpenSearchService::Domain",
+                    mechanism="opensearch_domain_policy",
+                    region=region,
+                    kwargs=kwargs,
+                )
+            )
+        return region, grants, None
+    except ClientError as e:
+        return region, [], e.response["Error"]["Message"]
+    except (BotoCoreError, Exception) as e:
+        return region, [], str(e)
+
+
 # Surfaces IAM Access Analyzer does not reason about. Run on both backends.
 BEYOND_AA_COLLECTORS: tuple[tuple[str, str, Any], ...] = (
     ("EventBridge bus policies", "EventBridge", _collect_eventbridge_in_region),
+    ("Glue Data Catalog resource policies", "Glue", _collect_glue_in_region),
+    ("OpenSearch domain access policies", "OpenSearch", _collect_opensearch_in_region),
 )
 
 
@@ -850,7 +917,7 @@ def collect_beyond_aa_grants(
     if not regions:
         skipped.append(
             {
-                "surface": "EventBridge bus policies",
+                "surface": "EventBridge / Glue / OpenSearch resource policies",
                 "detail": "No region configured; pass --region / --regions / --all-regions",
             }
         )
@@ -1268,7 +1335,7 @@ def collect_optional_scanners(
     regions: list[str],
     kwargs: dict[str, Any],
 ) -> tuple[list[dict[str, Any]], list[dict[str, str]], list[dict[str, str]]]:
-    """RAM / AMI / SSM / credentials / EventBridge collectors shared by both backends."""
+    """RAM / AMI / SSM / credentials / EventBridge / Glue / OpenSearch collectors shared by both backends."""
     grants: list[dict[str, Any]] = []
     scanned: list[dict[str, str]] = []
     skipped: list[dict[str, str]] = []
@@ -3062,7 +3129,8 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Require IAM Access Analyzer (fail if none exists). Default is to "
             "use analyzers when found and walk IAM/S3 policies otherwise. "
-            "RAM, AMI, SSM, and credentials still run unless skipped."
+            "RAM, AMI, SSM, credentials, EventBridge, Glue, and OpenSearch "
+            "still run unless skipped."
         ),
     )
     backend_group.add_argument(
@@ -3102,7 +3170,7 @@ def build_parser() -> argparse.ArgumentParser:
     region_group = parser.add_mutually_exclusive_group()
     region_group.add_argument(
         "--regions",
-        help="Comma-separated regions for regional collectors (RAM, AMI, SSM, AA)",
+        help="Comma-separated regions for RAM, AMI, SSM, AA, and resource-policy collectors",
     )
     region_group.add_argument(
         "--all-regions",
@@ -3111,9 +3179,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--format",
-        choices=["html", "md", "both"],
+        choices=["html", "md", "json", "both"],
         default=None,
-        help="Report format(s). Default: html when Access Analyzer is used, md for the policy scanner.",
+        help=(
+            "Report format(s). json is the machine-readable inventory (parties + grants). "
+            "both writes html and markdown. Default: html when Access Analyzer is used, "
+            "md for the policy scanner."
+        ),
     )
     parser.add_argument("--verbose", action="store_true", help="Show full error tracebacks")
     return parser
@@ -3131,6 +3203,69 @@ def _try_resolve_regions(session: boto3.Session, args: argparse.Namespace) -> li
     except (ValueError, RuntimeError) as e:
         console.print(f"[yellow]Warning: could not resolve regions: {e}[/yellow]")
         return []
+
+
+def generate_json_report(
+    grants: list[dict[str, Any]],
+    coverage: dict[str, Any],
+    *,
+    account_aliases: dict[str, str],
+    scope: str = "account",
+    output_dir: str = ".",
+    org_error: str | None = None,
+    badge: str = "",
+) -> str:
+    """Write a machine-readable inventory for SIEM / pipeline use."""
+    current_account_id = (
+        list(account_aliases.keys())[0] if account_aliases else "unknown"
+    )
+    current_account_alias = account_aliases.get(current_account_id, current_account_id)
+    slug = "org" if scope == "organization" else current_account_id
+    parties = parties_from_grants(grants)
+    payload = {
+        "tool": "aws-trustline",
+        "version": __version__,
+        "generated_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+        "badge": badge,
+        "scope": scope,
+        "account_id": current_account_id,
+        "account_alias": current_account_alias,
+        "org_error": org_error,
+        "totals": {
+            "grants": totals_from_grants(grants),
+            "parties": party_totals(parties),
+        },
+        "parties": [
+            {
+                "name": party["name"],
+                "account_id": party.get("account_id"),
+                "classification": party["classification"],
+                "name_source": party.get("name_source"),
+                "name_source_label": party.get("name_source_label"),
+                "grant_count": party["grant_count"],
+                "mechanisms": party["mechanisms"],
+                "resources": list(dict.fromkeys(party.get("resources") or [])),
+            }
+            for party in parties
+        ],
+        "leftovers": {
+            "missing_oidc_subject": [
+                g for g in grants if g.get("missing_oidc_subject")
+            ],
+            "missing_external_id": [
+                g for g in grants if g.get("missing_external_id")
+            ],
+            "never_expires": [g for g in grants if g.get("never_expires")],
+            "blocked_by_bpa": [g for g in grants if g.get("blocked_by_bpa")],
+        },
+        "grants": grants,
+        "coverage": coverage,
+    }
+    report_file = _report_filename(output_dir, slug, "json")
+    with open(report_file, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2, default=str)
+        fh.write("\n")
+    return report_file
 
 
 def _write_reports(
@@ -3166,6 +3301,17 @@ def _write_reports(
             badge=badge,
         )
         console.print(f"[bold green]HTML report: {html_path}[/bold green]")
+    if output_format == "json":
+        json_path = generate_json_report(
+            grants,
+            coverage,
+            account_aliases=account_aliases,
+            scope=scope,
+            output_dir=args.output,
+            org_error=org_error,
+            badge=badge,
+        )
+        console.print(f"[bold green]JSON report: {json_path}[/bold green]")
 
 
 def _run_access_analyzer_backend(

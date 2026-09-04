@@ -208,6 +208,17 @@ Resources:
                 - events:ListEventBuses
                 - events:DescribeEventBus
               Resource: "*"
+            - Sid: GlueCatalogPolicy
+              Effect: Allow
+              Action:
+                - glue:GetResourcePolicy
+              Resource: "*"
+            - Sid: OpenSearchDomainPolicies
+              Effect: Allow
+              Action:
+                - es:ListDomainNames
+                - es:DescribeDomain
+              Resource: "*"
             - Sid: SsmDocumentShares
               Effect: Allow
               Action:

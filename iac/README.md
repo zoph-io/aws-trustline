@@ -3,8 +3,9 @@
 Deploy [AWS Trustline](../README.md) as a scheduled AWS Lambda. Grant rows from
 IAM Access Analyzer (plus RAM / AMI / SSM / credentials) are classified against
 the [fwd:cloudsec](https://github.com/fwdcloudsec/known_aws_accounts) vendor
-dataset. The HTML report leads with leftover, ends with a collapsed coverage
-appendix, is uploaded to S3, and (optionally) summarized over SNS when leftover
+dataset. The HTML report leads with an inventory grouped by principal (names
+from fwd:cloudsec / Organizations), ends with a collapsed coverage appendix,
+is uploaded to S3, and (optionally) summarized over SNS when leftover
 warrants attention.
 
 The Access Analyzer external-access tier is free, so this stack adds no
@@ -17,7 +18,7 @@ storage, and any optional SNS deliveries.
 flowchart LR
     Sched["EventBridge Schedule<br/>(cron / rate)"] --> Fn
     Fn["Lambda<br/>aws-trustline-scanner"] -->|list_analyzers<br/>list_findings| AA["IAM Access Analyzer<br/>(external access, free)"]
-    Fn -->|fetch_reference_data| Vendors["fwd:cloudsec dataset<br/>(GitHub raw)"]
+    Fn -->|fetch_reference_data| Vendors["fwd:cloudsec dataset<br/>(GitHub + local cache)"]
     Fn -->|list_accounts| Orgs[AWS Organizations]
     Fn -->|put_object| S3["S3<br/>report bucket"]
     Fn -->|publish if findings| SNS["SNS topic<br/>(optional)"]

@@ -8,12 +8,15 @@ import unittest
 
 from grants import (
     actions_from_ram_permission,
+    apply_s3_effective_public,
     classify_parsed_principal,
     extract_account_id_from_iam_value,
     grants_from_policy_document,
+    index_known_accounts,
     merge_builtin_vendors,
     oidc_condition_gaps,
     parse_principal_value,
+    parties_from_grants,
     totals_from_grants,
 )
 
@@ -133,7 +136,7 @@ class CloudFrontPrincipalTests(unittest.TestCase):
                     "Action": "s3:GetObject",
                 }
             },
-            resource="arn:aws:s3:::asd.zoph.io",
+            resource="arn:aws:s3:::example-bucket",
             resource_type="AWS::S3::Bucket",
             mechanism="s3_bucket_policy",
             trusted_accounts={},
@@ -397,6 +400,198 @@ class TotalsTests(unittest.TestCase):
         self.assertEqual(totals["missing_external_id"], 1)
         self.assertEqual(totals["never_expires"], 1)
         self.assertEqual(totals["findings"], 5)
+
+
+class NameLookupTests(unittest.TestCase):
+    def test_unknown_account_is_labeled_not_in_dataset(self):
+        grants = grants_from_policy_document(
+            {
+                "Statement": {
+                    "Effect": "Allow",
+                    "Principal": {"AWS": "555555555555"},
+                    "Action": "sts:AssumeRole",
+                }
+            },
+            resource="arn:aws:iam::111122223333:role/Example",
+            resource_type="AWS::IAM::Role",
+            mechanism="trust_policy",
+            trusted_accounts={},
+            account_to_vendor={},
+            current_account_id="111122223333",
+        )
+        self.assertEqual(grants[0]["classification"], "unknown")
+        self.assertEqual(grants[0]["name_source"], "not_in_dataset")
+        self.assertEqual(
+            grants[0]["principal_label"],
+            "555555555555 (not in known_aws_accounts)",
+        )
+
+    def test_vendor_name_source_is_fwdcloudsec(self):
+        grants = grants_from_policy_document(
+            {
+                "Statement": {
+                    "Effect": "Allow",
+                    "Principal": {"AWS": "333333333333"},
+                    "Action": "sts:AssumeRole",
+                    "Condition": {"StringEquals": {"sts:ExternalId": "x"}},
+                }
+            },
+            resource="arn:aws:iam::111122223333:role/Example",
+            resource_type="AWS::IAM::Role",
+            mechanism="trust_policy",
+            trusted_accounts={},
+            account_to_vendor={"333333333333": {"name": "Datadog", "type": "third-party"}},
+            current_account_id="111122223333",
+        )
+        self.assertEqual(grants[0]["name_source"], "fwd:cloudsec")
+        self.assertIn("Datadog", grants[0]["principal_label"])
+
+    def test_yaml_trusted_source(self):
+        grants = grants_from_policy_document(
+            {
+                "Statement": {
+                    "Effect": "Allow",
+                    "Principal": {"AWS": "222222222222"},
+                    "Action": "sts:AssumeRole",
+                }
+            },
+            resource="arn:aws:iam::111122223333:role/Example",
+            resource_type="AWS::IAM::Role",
+            mechanism="trust_policy",
+            trusted_accounts={"222222222222": {"name": "Prod", "source": "yaml_file"}},
+            account_to_vendor={},
+            current_account_id="111122223333",
+        )
+        self.assertEqual(grants[0]["name_source"], "yaml_file")
+
+    def test_parties_group_two_grants_for_one_account(self):
+        role = grants_from_policy_document(
+            {
+                "Statement": {
+                    "Effect": "Allow",
+                    "Principal": {"AWS": "333333333333"},
+                    "Action": "sts:AssumeRole",
+                    "Condition": {"StringEquals": {"sts:ExternalId": "x"}},
+                }
+            },
+            resource="arn:aws:iam::111122223333:role/One",
+            resource_type="AWS::IAM::Role",
+            mechanism="trust_policy",
+            trusted_accounts={},
+            account_to_vendor={"333333333333": {"name": "Datadog"}},
+            current_account_id="111122223333",
+        )
+        bucket = grants_from_policy_document(
+            {
+                "Statement": {
+                    "Effect": "Allow",
+                    "Principal": {"AWS": "333333333333"},
+                    "Action": "s3:GetObject",
+                }
+            },
+            resource="example-bucket",
+            resource_type="AWS::S3::Bucket",
+            mechanism="s3_bucket_policy",
+            trusted_accounts={},
+            account_to_vendor={"333333333333": {"name": "Datadog"}},
+            current_account_id="111122223333",
+        )
+        parties = parties_from_grants(role + bucket)
+        self.assertEqual(len(parties), 1)
+        self.assertEqual(parties[0]["grant_count"], 2)
+        self.assertEqual(parties[0]["account_id"], "333333333333")
+        self.assertEqual(parties[0]["classification"], "vendor")
+
+    def test_unresolved_sorts_before_vendor(self):
+        unknown = grants_from_policy_document(
+            {
+                "Statement": {
+                    "Effect": "Allow",
+                    "Principal": {"AWS": "555555555555"},
+                    "Action": "sts:AssumeRole",
+                }
+            },
+            resource="arn:aws:iam::111122223333:role/A",
+            resource_type="AWS::IAM::Role",
+            mechanism="trust_policy",
+            trusted_accounts={},
+            account_to_vendor={},
+            current_account_id="111122223333",
+        )
+        vendor = grants_from_policy_document(
+            {
+                "Statement": {
+                    "Effect": "Allow",
+                    "Principal": {"AWS": "333333333333"},
+                    "Action": "sts:AssumeRole",
+                    "Condition": {"StringEquals": {"sts:ExternalId": "x"}},
+                }
+            },
+            resource="arn:aws:iam::111122223333:role/B",
+            resource_type="AWS::IAM::Role",
+            mechanism="trust_policy",
+            trusted_accounts={},
+            account_to_vendor={"333333333333": {"name": "Datadog"}},
+            current_account_id="111122223333",
+        )
+        parties = parties_from_grants(vendor + unknown)
+        self.assertEqual(parties[0]["classification"], "unknown")
+        self.assertEqual(parties[1]["classification"], "vendor")
+
+    def test_bpa_drops_public_from_inventory(self):
+        grants = grants_from_policy_document(
+            {
+                "Statement": {
+                    "Effect": "Allow",
+                    "Principal": "*",
+                    "Action": "s3:GetObject",
+                }
+            },
+            resource="example-bucket",
+            resource_type="AWS::S3::Bucket",
+            mechanism="s3_bucket_policy",
+            trusted_accounts={},
+            account_to_vendor={},
+            current_account_id="111122223333",
+        )
+        apply_s3_effective_public(grants[0], False)
+        self.assertTrue(grants[0]["blocked_by_bpa"])
+        self.assertFalse(grants[0]["is_public"])
+        self.assertEqual(grants[0]["classification"], "blocked_public")
+        self.assertEqual(parties_from_grants(grants), [])
+        totals = totals_from_grants(grants)
+        self.assertEqual(totals["public"], 0)
+        self.assertEqual(totals["blocked_public"], 1)
+
+    def test_bpa_unknown_keeps_public(self):
+        grants = grants_from_policy_document(
+            {
+                "Statement": {
+                    "Effect": "Allow",
+                    "Principal": "*",
+                    "Action": "s3:GetObject",
+                }
+            },
+            resource="example-bucket",
+            resource_type="AWS::S3::Bucket",
+            mechanism="s3_bucket_policy",
+            trusted_accounts={},
+            account_to_vendor={},
+            current_account_id="111122223333",
+        )
+        apply_s3_effective_public(grants[0], None)
+        self.assertTrue(grants[0]["is_public"])
+        self.assertEqual(grants[0]["classification"], "public")
+
+    def test_index_known_accounts_skips_bad_ids(self):
+        indexed = index_known_accounts(
+            [
+                {"name": "Datadog", "accounts": ["333333333333", "nope", 444455556666]},
+            ]
+        )
+        self.assertEqual(indexed["333333333333"]["name"], "Datadog")
+        self.assertEqual(indexed["444455556666"]["name"], "Datadog")
+        self.assertNotIn("nope", indexed)
 
 
 if __name__ == "__main__":

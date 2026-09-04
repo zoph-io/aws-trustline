@@ -121,6 +121,28 @@ MECHANISM_LABELS: dict[str, str] = {
     "access_analyzer": "Access Analyzer finding",
 }
 
+# Where a principal's display name came from. Reports print these labels.
+NAME_SOURCE_LABELS: dict[str, str] = {
+    "fwd:cloudsec": "fwd:cloudsec",
+    "aws_builtin": "AWS docs (builtin)",
+    "yaml_file": "trusted_accounts.yaml",
+    "aws_org": "AWS Organizations",
+    "aws_cloudfront": "Amazon CloudFront",
+    "not_in_dataset": "not in known_aws_accounts",
+    "federated": "federated (no account ID)",
+    "public": "everyone (*)",
+    "blocked_by_bpa": "blocked by Block Public Access",
+    "unresolved": "unresolved",
+}
+
+_PARTY_CLASS_RANK = {
+    "unknown": 0,
+    "public": 1,
+    "vendor": 2,
+    "federated": 3,
+    "trusted": 4,
+}
+
 
 def merge_builtin_vendors(
     account_to_vendor: dict[str, dict[str, Any]],
@@ -510,9 +532,150 @@ def empty_grant(**overrides: Any) -> dict[str, Any]:
         "analyzed_at": "",
         "id": "",
         "organization_id": None,
+        "name_source": "",
+        "blocked_by_bpa": False,
+        "effective_public": None,
     }
     grant.update(overrides)
     return grant
+
+
+def lookup_name_source(
+    *,
+    classification: str,
+    vendor: dict[str, Any] | None,
+    trusted: dict[str, Any] | None,
+    parsed: dict[str, Any],
+) -> str:
+    """Directory that produced the principal's display name."""
+    if parsed.get("is_public"):
+        return "public"
+    if parsed.get("kind") == "federated":
+        return "federated"
+    if trusted:
+        return str(trusted.get("source") or "trusted")
+    if vendor:
+        if vendor.get("type") == "aws-support":
+            return "aws_builtin"
+        return "fwd:cloudsec"
+    if parsed.get("account_id"):
+        return "not_in_dataset"
+    return "unresolved"
+
+
+def apply_s3_effective_public(
+    grant: dict[str, Any],
+    is_effectively_public: bool | None,
+) -> dict[str, Any]:
+    """If GetBucketPolicyStatus says the bucket is not public, this is not current access.
+
+    ``None`` means the API failed — keep the Allow-* row as public (conservative).
+    """
+    if grant.get("resource_type") != "AWS::S3::Bucket":
+        return grant
+    if not grant.get("is_public"):
+        return grant
+    grant["effective_public"] = is_effectively_public
+    if is_effectively_public is False:
+        grant["is_public"] = False
+        grant["blocked_by_bpa"] = True
+        grant["classification"] = "blocked_public"
+        grant["name_source"] = "blocked_by_bpa"
+    return grant
+
+
+def _party_sort_key(party: dict[str, Any]) -> tuple[int, int, str]:
+    rank = _PARTY_CLASS_RANK.get(party["classification"], 9)
+    name = (party.get("name") or "").lower()
+    federated_rank = 1
+    if party["classification"] == "federated":
+        if "github" in name or "gitlab" in name:
+            federated_rank = 0
+        elif "cognito" in name:
+            federated_rank = 2
+    return (rank, federated_rank, party.get("name") or "")
+
+
+def party_identity_key(grant: dict[str, Any]) -> str:
+    """Group key: one AWS account, one federated issuer, or public."""
+    if grant.get("blocked_by_bpa") or grant.get("classification") == "blocked_public":
+        return f"bpa:{grant.get('resource') or ''}"
+    if grant.get("is_public") or grant.get("classification") == "public":
+        return "public:*"
+    account_id = grant.get("principal_account_id")
+    if account_id:
+        return f"account:{account_id}"
+    kind = grant.get("principal_kind") or ""
+    label = grant.get("principal_label") or grant.get("principal") or ""
+    if kind == "federated":
+        return f"federated:{label}"
+    if kind == "cloudfront":
+        return f"cloudfront:{label}"
+    org_id = grant.get("organization_id")
+    if org_id:
+        return f"org:{org_id}"
+    return f"other:{label}"
+
+
+def parties_from_grants(grants: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse grant rows into one party per external principal.
+
+    Blocked-by-BPA rows are omitted — they are not current access.
+    """
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for grant in grants:
+        if grant.get("blocked_by_bpa") or grant.get("classification") == "blocked_public":
+            continue
+        grouped.setdefault(party_identity_key(grant), []).append(grant)
+
+    parties: list[dict[str, Any]] = []
+    for key, items in grouped.items():
+        first = items[0]
+        mechanisms = list(
+            dict.fromkeys(
+                MECHANISM_LABELS.get(g.get("mechanism") or "", g.get("mechanism") or "")
+                for g in items
+            )
+        )
+        parties.append(
+            {
+                "key": key,
+                "name": first.get("principal_label") or first.get("principal") or "",
+                "account_id": first.get("principal_account_id"),
+                "name_source": first.get("name_source") or "",
+                "name_source_label": NAME_SOURCE_LABELS.get(
+                    first.get("name_source") or "",
+                    first.get("name_source") or "",
+                ),
+                "classification": first.get("classification") or "unknown",
+                "grant_count": len(items),
+                "mechanisms": mechanisms,
+                "resources": [g.get("resource") or "" for g in items],
+                "grants": items,
+            }
+        )
+    parties.sort(key=_party_sort_key)
+    return parties
+
+
+def index_known_accounts(vendors_data: Any) -> dict[str, dict[str, Any]]:
+    """Index fwd:cloudsec-shaped YAML (list of {name, accounts, ...}) by account ID."""
+    account_to_vendor: dict[str, dict[str, Any]] = {}
+    if not isinstance(vendors_data, list):
+        return account_to_vendor
+    for vendor in vendors_data:
+        if not isinstance(vendor, dict):
+            continue
+        for raw_id in vendor.get("accounts") or []:
+            account_id = str(raw_id).strip()
+            if len(account_id) != 12 or not account_id.isdigit():
+                continue
+            account_to_vendor[account_id] = {
+                "name": vendor.get("name", "Unknown"),
+                "type": vendor.get("type", "third-party"),
+                "source": vendor.get("source", []),
+            }
+    return account_to_vendor
 
 
 def grant_from_parsed_principal(
@@ -552,11 +715,19 @@ def grant_from_parsed_principal(
     if parsed.get("kind") == "federated":
         oidc_gaps = oidc_condition_gaps(parsed.get("raw") or "", condition)
 
+    name_source = lookup_name_source(
+        classification=classification,
+        vendor=vendor,
+        trusted=trusted,
+        parsed=parsed,
+    )
     principal_label = parsed["label"]
     if parsed.get("account_id") and classification == "vendor" and vendor:
         principal_label = f"{parsed['account_id']} ({vendor.get('name')})"
     elif parsed.get("account_id") and classification == "trusted" and trusted:
         principal_label = f"{parsed['account_id']} ({trusted.get('name')})"
+    elif parsed.get("account_id") and classification == "unknown":
+        principal_label = f"{parsed['account_id']} (not in known_aws_accounts)"
 
     return empty_grant(
         resource=resource,
@@ -573,6 +744,7 @@ def grant_from_parsed_principal(
         classification=classification,
         vendor=vendor,
         trusted=trusted,
+        name_source=name_source,
         is_public=bool(parsed.get("is_public")),
         missing_external_id=missing_external_id,
         missing_oidc_subject=bool(oidc_gaps),
@@ -659,13 +831,16 @@ def totals_from_grants(grants: Iterable[dict[str, Any]]) -> dict[str, int]:
         "missing_external_id": 0,
         "missing_oidc_subject": 0,
         "never_expires": 0,
+        "blocked_public": 0,
         "findings": 0,
     }
     for grant in grants:
         totals["findings"] += 1
         classification = grant.get("classification")
-        if classification == "public":
+        if grant.get("is_public") or classification == "public":
             totals["public"] += 1
+        elif classification == "blocked_public":
+            totals["blocked_public"] += 1
         elif classification == "trusted":
             totals["trusted"] += 1
         elif classification == "vendor":
@@ -710,8 +885,11 @@ def build_coverage(
         not_scanned.insert(
             1,
             {
-                "surface": "Deny statements, conditions, and S3 Block Public Access",
-                "detail": "Policy scanner is Allow-principal matching, not a policy evaluator",
+                "surface": "Deny statements and most conditions",
+                "detail": (
+                    "Policy scanner is Allow-principal matching. Public S3 rows "
+                    "are checked with GetBucketPolicyStatus (Block Public Access)."
+                ),
             },
         )
     elif backend == "access_analyzer":

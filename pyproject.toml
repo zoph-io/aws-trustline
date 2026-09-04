@@ -1,7 +1,7 @@
 [project]
 name = "aws-trustline"
-version = "0.3.0"
-description = "Map and audit third-party trust relationships in your AWS account"
+version = "0.4.0"
+description = "Map current external access in an AWS account and name known account IDs"
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]

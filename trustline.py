@@ -4,17 +4,17 @@
 """
 AWS Trustline - Map and audit third-party trust relationships in your AWS account.
 
-Expands IAM trusts, S3 bucket policies, RAM shares, AMI launch permissions,
-SSM document shares, and IAM service-specific credentials into grant rows
-(one resource × one principal × one mechanism). Account IDs are matched
-against fwd:cloudsec known vendor accounts. Federated principals (GitHub
-Actions OIDC, SAML, Cognito) are classified separately — the account ID in
-an OIDC provider ARN is yours, not the external party.
+Expands sharing records into grant rows, groups them by external principal,
+and resolves 12-digit account IDs against fwd:cloudsec known vendor accounts.
+If an Access Analyzer exists it is used by default (effective access); otherwise
+IAM trusts and S3 bucket policies are walked. RAM, AMI, SSM, and credentials
+always run unless skipped.
 
 Usage:
     python trustline.py
     python trustline.py --profile my-profile --region us-east-1
     python trustline.py --all-regions --format both
+    python trustline.py --policy-scanner
     python trustline.py --use-access-analyzer --wait-for-analyzer
 """
 
@@ -44,19 +44,22 @@ from grants import (
     MECHANISM_LABELS,
     SERVICE_SPECIFIC_CREDENTIAL_SERVICES,
     actions_from_ram_permission,
+    apply_s3_effective_public,
     build_coverage,
     empty_grant,
     grant_from_parsed_principal,
     grants_from_policy_document,
+    index_known_accounts,
     is_aws_service_principal,
     merge_builtin_vendors,
     oidc_condition_gaps,
     parse_principal_value,
+    parties_from_grants,
     should_flag_missing_external_id,
     totals_from_grants,
 )
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 REFERENCE_DATA_URL = (
     "https://raw.githubusercontent.com/fwdcloudsec/known_aws_accounts/main/accounts.yaml"
@@ -64,6 +67,7 @@ REFERENCE_DATA_URL = (
 DEFAULT_TRUSTED_ACCOUNTS_FILE = "trusted_accounts.yaml"
 DEFAULT_OUTPUT_DIR = "reports"
 DEFAULT_WAIT_TIMEOUT = 300
+CACHE_DIR_ENV = "TRUSTLINE_CACHE_DIR"
 
 # External-access analyzer types (excludes unused-access and internal-access).
 EXTERNAL_ANALYZER_TYPES = {"ACCOUNT", "ORGANIZATION"}
@@ -83,28 +87,50 @@ AA_MAX_WORKERS = 8
 console = Console()
 
 
+def _known_accounts_cache_path() -> str:
+    base = os.environ.get(CACHE_DIR_ENV) or os.path.join(
+        os.path.expanduser("~"), ".cache", "aws-trustline"
+    )
+    return os.path.join(base, "known_aws_accounts.yaml")
+
+
+def _write_known_accounts_cache(path: str, body: str) -> None:
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    tmp = f"{path}.tmp"
+    with open(tmp, "w") as fh:
+        fh.write(body)
+    os.replace(tmp, path)
+
+
 def fetch_reference_data() -> dict[str, dict[str, Any]]:
-    """Fetch the reference data of known AWS accounts from fwd:cloudsec on GitHub."""
+    """Fetch known AWS accounts from fwd:cloudsec; fall back to a local cache."""
+    cache_path = _known_accounts_cache_path()
     try:
         response = requests.get(REFERENCE_DATA_URL, timeout=15)
         response.raise_for_status()
-
-        vendors_data = yaml.safe_load(response.text)
-
-        account_to_vendor: dict[str, dict[str, Any]] = {}
-        for vendor in vendors_data:
-            for account_id in vendor.get("accounts", []):
-                account_to_vendor[account_id] = {
-                    "name": vendor.get("name", "Unknown"),
-                    "type": vendor.get("type", "third-party"),
-                    "source": vendor.get("source", []),
-                }
-
-        return merge_builtin_vendors(account_to_vendor)
-
+        indexed = index_known_accounts(yaml.safe_load(response.text))
+        try:
+            _write_known_accounts_cache(cache_path, response.text)
+        except OSError as e:
+            console.print(f"[yellow]Could not write known-accounts cache: {e}[/yellow]")
+        return merge_builtin_vendors(indexed)
     except Exception as e:
-        console.print(f"[bold red]Error fetching reference data: {e}[/bold red]")
-        return merge_builtin_vendors({})
+        console.print(f"[bold yellow]Could not fetch known AWS accounts: {e}[/bold yellow]")
+        try:
+            with open(cache_path, "r") as fh:
+                cached = fh.read()
+            indexed = index_known_accounts(yaml.safe_load(cached))
+            console.print(
+                f"[green]Using cached known AWS accounts from {cache_path}[/green]"
+            )
+            return merge_builtin_vendors(indexed)
+        except OSError:
+            console.print(
+                "[yellow]No local cache; resolving names from builtin aliases only.[/yellow]"
+            )
+            return merge_builtin_vendors({})
 
 
 def fetch_org_accounts(session: boto3.Session) -> tuple[dict[str, dict[str, Any]], str | None]:
@@ -304,11 +330,26 @@ def collect_iam_role_grants(
     return grants
 
 
+def _bucket_is_effectively_public(s3_client: Any, bucket_name: str) -> bool | None:
+    """GetBucketPolicyStatus.IsPublic, or None if the call fails."""
+    try:
+        status = s3_client.get_bucket_policy_status(Bucket=bucket_name)
+        return bool((status.get("PolicyStatus") or {}).get("IsPublic"))
+    except ClientError:
+        return None
+    except (BotoCoreError, Exception):
+        return None
+
+
 def collect_s3_bucket_grants(
     session: boto3.Session,
     **kwargs: Any,
 ) -> list[dict[str, Any]]:
-    """Expand S3 bucket policies into grant rows."""
+    """Expand S3 bucket policies into grant rows.
+
+    Public ``Principal: "*"`` rows are checked with GetBucketPolicyStatus so
+    Block Public Access is not reported as current public access.
+    """
     console.print("[bold blue]Checking S3 bucket policies...[/bold blue]")
     grants: list[dict[str, Any]] = []
     try:
@@ -326,21 +367,24 @@ def collect_s3_bucket_grants(
                     f"{e.response['Error']['Message']}[/yellow]"
                 )
                 continue
-            grants.extend(
-                grants_from_policy_document(
-                    policy_document,
-                    resource=bucket_name,
-                    resource_type="AWS::S3::Bucket",
-                    mechanism="s3_bucket_policy",
-                    region="global",
-                    trusted_accounts=kwargs["trusted_accounts"],
-                    account_to_vendor=kwargs["account_to_vendor"],
-                    current_account_id=kwargs["current_account_id"],
-                    owner_account=kwargs["owner_account"],
-                    owner_label=kwargs["owner_label"],
-                    our_organization_id=kwargs["our_organization_id"],
-                )
+            bucket_grants = grants_from_policy_document(
+                policy_document,
+                resource=bucket_name,
+                resource_type="AWS::S3::Bucket",
+                mechanism="s3_bucket_policy",
+                region="global",
+                trusted_accounts=kwargs["trusted_accounts"],
+                account_to_vendor=kwargs["account_to_vendor"],
+                current_account_id=kwargs["current_account_id"],
+                owner_account=kwargs["owner_account"],
+                owner_label=kwargs["owner_label"],
+                our_organization_id=kwargs["our_organization_id"],
             )
+            if any(g.get("is_public") for g in bucket_grants):
+                effectively_public = _bucket_is_effectively_public(s3_client, bucket_name)
+                for grant in bucket_grants:
+                    apply_s3_effective_public(grant, effectively_public)
+            grants.extend(bucket_grants)
         console.print(f"[green]S3 bucket policy grants: {len(grants)}[/green]")
     except Exception as e:
         console.print(f"[bold red]Error checking S3 bucket policies: {e}[/bold red]")
@@ -818,7 +862,7 @@ def _coverage_markdown(coverage: dict[str, Any]) -> str:
     lines = ["## Coverage (appendix)\n"]
     lines.append(
         "A green leftover list only covers **scanned** surfaces. "
-        "This section is last on purpose — leftover is the work list.\n"
+        "This section is last on purpose — the inventory is the work list.\n"
     )
     backend = coverage.get("backend", "")
     if backend:
@@ -851,25 +895,37 @@ def _grant_resource_name(grant: dict[str, Any]) -> str:
     return _short_resource(grant.get("resource") or "")
 
 
-def _federated_sort_key(grant: dict[str, Any]) -> tuple[int, str]:
-    """GitHub/GitLab first (actionable), Cognito last (app identity)."""
-    label = (grant.get("principal_label") or "").lower()
-    resource = grant.get("resource") or ""
-    if "github" in label or "gitlab" in label:
-        return (0, resource)
-    if "cognito" in label:
-        return (2, resource)
-    return (1, resource)
+def _party_resource_summary(party: dict[str, Any], *, limit: int = 6) -> str:
+    names = [_short_resource(r) for r in (party.get("resources") or []) if r]
+    if len(names) > limit:
+        return ", ".join(names[:limit]) + f" +{len(names) - limit} more"
+    return ", ".join(names) or "—"
 
 
-def _matching_grants(grants: list[dict[str, Any]], predicate) -> list[dict[str, Any]]:
-    return [g for g in grants if predicate(g)]
-
-
-def _federated_grants(grants: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    items = _matching_grants(grants, lambda g: g.get("classification") == "federated")
-    items.sort(key=_federated_sort_key)
-    return items
+def _inventory_markdown(grants: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
+    parties = parties_from_grants(grants)
+    blocked = [g for g in grants if g.get("blocked_by_bpa")]
+    lines = [
+        "## External access (by principal)\n\n",
+        "One row per external party. Account IDs are looked up in "
+        "[fwd:cloudsec known AWS accounts](https://github.com/fwdcloudsec/known_aws_accounts). "
+        "Unresolved means the ID was not in that dataset, your YAML, or Organizations.\n\n",
+    ]
+    if not parties:
+        lines.append("No current external access in scanned surfaces.\n\n")
+    else:
+        lines.append(
+            "| Principal | Name source | Classification | Grants | Mechanisms | Resources |\n"
+            "|-----------|-------------|----------------|--------|------------|-----------|\n"
+        )
+        for party in parties:
+            lines.append(
+                f"| {party['name']} | {party['name_source_label']} | "
+                f"{party['classification']} | {party['grant_count']} | "
+                f"{', '.join(party['mechanisms'])} | {_party_resource_summary(party)} |\n"
+            )
+        lines.append("\n")
+    return "".join(lines), blocked
 
 
 def generate_markdown_report(
@@ -882,7 +938,7 @@ def generate_markdown_report(
     identity_slug: str | None = None,
     identity_label: str | None = None,
 ) -> str:
-    """Write a grant-row Markdown report (leftover first; coverage appendix last)."""
+    """Write a report: inventory by principal, then leftover flags, coverage last."""
     current_account_id = (
         list(account_aliases.keys())[0] if account_aliases else "Unknown"
     )
@@ -891,9 +947,12 @@ def generate_markdown_report(
     label = identity_label or f"{current_account_id} ({current_account_alias})"
     report_file = _report_filename(output_dir, slug, "md")
     totals = totals_from_grants(grants)
+    parties = parties_from_grants(grants)
 
     def _rows(predicate) -> list[dict[str, Any]]:
         return [g for g in grants if predicate(g)]
+
+    inventory, blocked = _inventory_markdown(grants)
 
     with open(report_file, "w") as f:
         f.write("# AWS Trustline - Access Analysis Report\n\n")
@@ -904,18 +963,21 @@ def generate_markdown_report(
             f.write(f"Could not access AWS Organizations API: {org_error}\n\n")
         f.write("## Summary\n\n")
         f.write(
+            f"- External parties: {len(parties)}\n"
             f"- Trusted: {totals['trusted']}\n"
             f"- Known vendors: {totals['vendors']}\n"
             f"- Federated (OIDC/SAML/Cognito): {totals['federated']}\n"
-            f"- Unknown: {totals['unknown']}\n"
+            f"- Not in known_aws_accounts: {totals['unknown']}\n"
             f"- Public: {totals['public']}\n"
+            f"- Blocked by Block Public Access: {totals['blocked_public']}\n"
             f"- Missing ExternalId: {totals['missing_external_id']}\n"
             f"- OIDC missing sub/aud: {totals['missing_oidc_subject']}\n"
             f"- Never-expiring service credentials: {totals['never_expires']}\n"
             f"- Total grants: {totals['findings']}\n\n"
         )
+        f.write(inventory)
 
-        def write_grant_table(title: str, items: list[dict[str, Any]], _empty: str) -> None:
+        def write_grant_table(title: str, items: list[dict[str, Any]]) -> None:
             if not items:
                 return
             f.write(f"## {title}\n\n")
@@ -930,44 +992,20 @@ def generate_markdown_report(
             f.write("\n")
 
         write_grant_table(
-            "Public access",
-            _rows(lambda g: g.get("is_public") or g.get("classification") == "public"),
-            "No public grants found in scanned surfaces.",
-        )
-        write_grant_table(
-            "Unknown principals (work list)",
-            _rows(lambda g: g.get("classification") == "unknown"),
-            "No unknown principals.",
-        )
-        write_grant_table(
             "OIDC trusts missing sub/aud conditions",
             _rows(lambda g: g.get("missing_oidc_subject")),
-            "No GitHub/GitLab OIDC trusts missing subject/audience conditions.",
         )
         write_grant_table(
             "IAM roles missing ExternalId condition",
             _rows(lambda g: g.get("missing_external_id")),
-            "No cross-account roles missing sts:ExternalId.",
         )
         write_grant_table(
             "Never-expiring service-specific credentials",
             _rows(lambda g: g.get("never_expires")),
-            "No active never-expiring service-specific credentials.",
         )
         write_grant_table(
-            "Federated principals (OIDC / SAML / Cognito)",
-            _federated_grants(grants),
-            "No federated principals.",
-        )
-        write_grant_table(
-            "Known vendors",
-            _rows(lambda g: g.get("classification") == "vendor"),
-            "No known-vendor grants.",
-        )
-        write_grant_table(
-            "Trusted principals",
-            _rows(lambda g: g.get("classification") == "trusted"),
-            "No trusted-principal grants.",
+            "Policy allows everyone; Block Public Access denies it",
+            blocked,
         )
         f.write(_coverage_markdown(coverage))
     return report_file
@@ -978,16 +1016,43 @@ def display_grants(
     coverage: dict[str, Any],
     account_aliases: dict[str, str],
 ) -> None:
-    """Render grant rows to the console."""
+    """Render the principal inventory, then leftover flags."""
     current_account_id = (
         list(account_aliases.keys())[0] if account_aliases else "Unknown"
     )
     current_account_alias = account_aliases.get(current_account_id, current_account_id)
     totals = totals_from_grants(grants)
+    parties = parties_from_grants(grants)
 
     console.print(
         f"\n[cyan]Analyzing:[/cyan] {current_account_id} ({current_account_alias})\n"
     )
+
+    if parties:
+        table = Table(
+            title=f"External access by principal ({len(parties)})",
+            box=box.ROUNDED,
+        )
+        table.add_column("Principal", style="cyan", overflow="fold")
+        table.add_column("Name source", style="blue", overflow="fold")
+        table.add_column("Class", style="green")
+        table.add_column("Grants", justify="right")
+        table.add_column("Resources", overflow="fold")
+        for party in parties[:50]:
+            row = (
+                party["name"],
+                party["name_source_label"],
+                party["classification"],
+                str(party["grant_count"]),
+                _party_resource_summary(party),
+            )
+            if party["classification"] == "unknown":
+                table.add_row(*row, style="yellow")
+            else:
+                table.add_row(*row)
+        if len(parties) > 50:
+            table.add_row("…", f"+{len(parties) - 50} more", "", "", "")
+        console.print(table)
 
     def _table(title: str, items: list[dict[str, Any]], color: str) -> None:
         if not items:
@@ -1009,16 +1074,6 @@ def display_grants(
         console.print(table)
 
     _table(
-        "Public access",
-        [g for g in grants if g.get("is_public") or g.get("classification") == "public"],
-        "red",
-    )
-    _table(
-        "Unknown principals (work list)",
-        [g for g in grants if g.get("classification") == "unknown"],
-        "yellow",
-    )
-    _table(
         "OIDC missing sub/aud",
         [g for g in grants if g.get("missing_oidc_subject")],
         "red",
@@ -1034,24 +1089,21 @@ def display_grants(
         "red",
     )
     _table(
-        "Federated principals",
-        _federated_grants(grants),
+        "Blocked by Block Public Access",
+        [g for g in grants if g.get("blocked_by_bpa")],
         "yellow",
-    )
-    _table(
-        "Known vendors",
-        [g for g in grants if g.get("classification") == "vendor"],
-        "cyan",
     )
 
     console.print(
         Panel(
             f"[bold]Summary:[/bold]\n"
+            f"[cyan]External parties:[/cyan] {len(parties)}\n"
             f"[green]Trusted:[/green] {totals['trusted']}\n"
             f"[cyan]Known vendors:[/cyan] {totals['vendors']}\n"
             f"[blue]Federated:[/blue] {totals['federated']}\n"
-            f"[yellow]Unknown:[/yellow] {totals['unknown']}\n"
+            f"[yellow]Not in known_aws_accounts:[/yellow] {totals['unknown']}\n"
             f"[red]Public:[/red] {totals['public']}\n"
+            f"[dim]Blocked by BPA:[/dim] {totals['blocked_public']}\n"
             f"[red]Missing ExternalId:[/red] {totals['missing_external_id']}\n"
             f"[red]OIDC missing sub/aud:[/red] {totals['missing_oidc_subject']}\n"
             f"[red]Never-expiring credentials:[/red] {totals['never_expires']}\n"
@@ -1872,6 +1924,8 @@ def _html_classification_pill(finding: dict[str, Any]) -> str:
         if first_source:
             return f'<a href="{_h(first_source)}" target="_blank" rel="noopener noreferrer">{pill}</a>'
         return pill
+    if classification == "blocked_public":
+        return _html_pill("blocked by BPA", "warn")
     return _html_pill("unknown", "warn")
 
 
@@ -2000,7 +2054,7 @@ def _render_coverage_html(coverage: dict[str, Any]) -> str:
         '<details class="coverage">'
         f"<summary>Coverage — {n_scanned} scanned, {n_skip} not scanned</summary>"
         '<div class="coverage-body">'
-        '<div class="callout info"><strong>A green leftover list only covers scanned surfaces.</strong> '
+        '<div class="callout info"><strong>The inventory only covers scanned surfaces.</strong> '
         "Analyzer status ACTIVE is not scan-complete; first scans can take ~20 minutes."
         f"{notes_html}</div>"
         + scanned_table
@@ -2038,8 +2092,9 @@ def generate_html_report(
     org_error: str | None = None,
     badge: str = "Policy scanner",
 ) -> str:
-    """Write a grant-row HTML report (leftover first; coverage appendix last)."""
+    """Write HTML: inventory by principal, leftover flags, coverage appendix."""
     totals = totals_from_grants(grants)
+    parties = parties_from_grants(grants)
     current_account_id = (
         list(account_aliases.keys())[0] if account_aliases else "unknown"
     )
@@ -2064,25 +2119,27 @@ def generate_html_report(
         '<section class="hero"><div>'
         '<h1>Trustline<span style="color:var(--accent)">_</span>'
         f'<span class="badge">{_h(badge)}</span></h1>'
-        '<p>External access grants, classified against the '
+        '<p>Current external access on this account. 12-digit account IDs are '
+        'looked up in the '
         '<a href="https://github.com/fwdcloudsec/known_aws_accounts" target="_blank" rel="noopener noreferrer">fwd:cloudsec</a> '
-        'vendor dataset. Unknown leftover is the work list.</p>'
+        'dataset. Unresolved IDs were not in that list, your YAML, or Organizations.</p>'
         '<div class="meta meta-row">'
         f"<span><strong>Account/Org:</strong> {_h(identity_label)}</span>"
+        f"<span><strong>Parties:</strong> {len(parties)}</span>"
         f"<span><strong>Grants:</strong> {totals['findings']}</span>"
         f"<span><strong>Generated:</strong> {_h(datetime.now().strftime('%Y-%m-%d %H:%M:%S'))}</span>"
         "</div></div></section>"
     )
     kpis_html = (
         '<div class="kpis">'
-        + _render_kpi("Trusted", totals["trusted"], "Org + YAML + CloudFront OAI")
+        + _render_kpi("External parties", len(parties), "Grouped by account ID or issuer")
+        + _render_kpi("Not in dataset", totals["unknown"], "Looked up, no name", danger=totals["unknown"] > 0)
         + _render_kpi("Known vendors", totals["vendors"], "fwd:cloudsec + AWS aliases")
+        + _render_kpi("Trusted", totals["trusted"], "Org + YAML + CloudFront OAI")
         + _render_kpi("Federated", totals["federated"], "OIDC / SAML / Cognito")
-        + _render_kpi("Unknown", totals["unknown"], "Principals to review", danger=totals["unknown"] > 0)
-        + _render_kpi("Public", totals["public"], "Shared with everyone", danger=totals["public"] > 0)
+        + _render_kpi("Public", totals["public"], "Currently public", danger=totals["public"] > 0)
         + _render_kpi("Missing ExternalId", totals["missing_external_id"], "Confused deputy", danger=totals["missing_external_id"] > 0)
         + _render_kpi("OIDC gaps", totals["missing_oidc_subject"], "Missing sub/aud", danger=totals["missing_oidc_subject"] > 0)
-        + _render_kpi("Never-expiring keys", totals["never_expires"], "Service-specific credentials", danger=totals["never_expires"] > 0)
         + "</div>"
     )
 
@@ -2103,26 +2160,39 @@ def generate_html_report(
             neutral=neutral,
         )
 
+    party_rows = "".join(
+        "<tr>"
+        f"<td>{_h(party['name'])}</td>"
+        f"<td class=\"muted\">{_h(party['name_source_label'])}</td>"
+        f"<td>{_h(party['classification'])}</td>"
+        f"<td>{party['grant_count']}</td>"
+        f"<td class=\"muted\">{_h(', '.join(party['mechanisms']))}</td>"
+        f"<td class=\"muted\">{_h(_party_resource_summary(party))}</td>"
+        "</tr>"
+        for party in parties
+    )
+    if parties:
+        inventory_html = _render_section(
+            "External access by principal",
+            party_rows,
+            ["Principal", "Name source", "Classification", "Grants", "Mechanisms", "Resources"],
+            subtitle=f"{len(parties)} external part{'y' if len(parties) == 1 else 'ies'}",
+            empty_message="No current external access in scanned surfaces.",
+            neutral=True,
+        )
+    else:
+        inventory_html = (
+            '<div class="callout info"><strong>No current external access</strong> '
+            "in scanned surfaces.</div>"
+        )
+
     parts: list[str] = []
     if org_error:
         parts.append(
             '<div class="callout"><strong>AWS Organizations:</strong> '
             f"{_h(org_error)}</div>"
         )
-    parts.append(
-        section(
-            "Public access",
-            [g for g in grants if g.get("is_public") or g.get("classification") == "public"],
-            "No public grants in scanned surfaces.",
-        )
-    )
-    parts.append(
-        section(
-            "Unknown principals (work list)",
-            [g for g in grants if g.get("classification") == "unknown"],
-            "No unknown principals.",
-        )
-    )
+    parts.append(inventory_html)
     parts.append(
         section(
             "OIDC trusts missing sub/aud",
@@ -2146,26 +2216,10 @@ def generate_html_report(
     )
     parts.append(
         section(
-            "Federated principals",
-            _federated_grants(grants),
-            "No federated principals.",
-            subtitle="GitHub/GitLab first. Cognito identity-pool roles are app identity, not third-party accounts.",
-            neutral=True,
-        )
-    )
-    parts.append(
-        section(
-            "Known vendors",
-            [g for g in grants if g.get("classification") == "vendor"],
-            "No known-vendor grants.",
-            neutral=True,
-        )
-    )
-    parts.append(
-        section(
-            "Trusted principals",
-            [g for g in grants if g.get("classification") == "trusted"],
-            "No trusted-principal grants.",
+            "Policy allows everyone; Block Public Access denies it",
+            [g for g in grants if g.get("blocked_by_bpa")],
+            "No BPA-blocked public policies.",
+            subtitle="Allow * is in the policy but GetBucketPolicyStatus is not public.",
             neutral=True,
         )
     )
@@ -2213,8 +2267,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="trustline",
         description=(
-            "AWS Trustline - Map external access grants in your AWS account "
-            "and name the vendor when the account is known."
+            "AWS Trustline - Map current external access in your AWS account "
+            "and name the vendor when the account ID is known."
         ),
     )
     parser.add_argument(
@@ -2247,12 +2301,22 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Skip IAM service-specific credentials / long-lived API keys",
     )
-    parser.add_argument(
+    backend_group = parser.add_mutually_exclusive_group()
+    backend_group.add_argument(
         "--use-access-analyzer",
         action="store_true",
         help=(
-            "Use IAM Access Analyzer findings instead of the IAM/S3 policy scanner. "
-            "RAM, AMI, SSM, and service-specific credentials still run unless skipped."
+            "Require IAM Access Analyzer (fail if none exists). Default is to "
+            "use analyzers when found and walk IAM/S3 policies otherwise. "
+            "RAM, AMI, SSM, and credentials still run unless skipped."
+        ),
+    )
+    backend_group.add_argument(
+        "--policy-scanner",
+        action="store_true",
+        help=(
+            "Walk IAM role trusts and S3 bucket policies even if Access Analyzer "
+            "exists. Public S3 rows are checked with GetBucketPolicyStatus."
         ),
     )
     parser.add_argument(
@@ -2260,6 +2324,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Poll Access Analyzer until ACTIVE finding counts stabilize. "
+            "Applies when analyzers are used (default hybrid or --use-access-analyzer). "
             "ACTIVE is not scan-complete; first scans can take ~20 minutes."
         ),
     )
@@ -2292,16 +2357,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--format",
         choices=["html", "md", "both"],
         default=None,
-        help="Report format(s). Default: html for Access Analyzer, md for the policy scanner.",
+        help="Report format(s). Default: html when Access Analyzer is used, md for the policy scanner.",
     )
     parser.add_argument("--verbose", action="store_true", help="Show full error tracebacks")
     return parser
 
 
-def _resolve_format(args: argparse.Namespace) -> str:
+def _resolve_format(args: argparse.Namespace, using_access_analyzer: bool) -> str:
     if args.format:
         return args.format
-    return "html" if args.use_access_analyzer else "md"
+    return "html" if using_access_analyzer else "md"
 
 
 def _try_resolve_regions(session: boto3.Session, args: argparse.Namespace) -> list[str]:
@@ -2357,6 +2422,7 @@ def _run_access_analyzer_backend(
     output_format: str,
     our_organization_id: str | None,
     org_error: str | None,
+    analyzers: dict[str, dict[str, str]] | None = None,
 ) -> int:
     try:
         regions = resolve_regions(session, args)
@@ -2364,11 +2430,12 @@ def _run_access_analyzer_backend(
         console.print(f"[bold red]Error resolving regions: {e}[/bold red]")
         return 1
 
-    console.print(
-        f"[bold]Discovering external analyzers in {len(regions)} region(s) "
-        f"(scope: {args.scope})...[/bold]"
-    )
-    analyzers = find_external_analyzers(session, regions, args.scope)
+    if analyzers is None:
+        console.print(
+            f"[bold]Discovering external analyzers in {len(regions)} region(s) "
+            f"(scope: {args.scope})...[/bold]"
+        )
+        analyzers = find_external_analyzers(session, regions, args.scope)
 
     missing = [r for r in regions if r not in analyzers]
     if missing:
@@ -2532,16 +2599,17 @@ def _run_policy_scanner(
 
 
 def _all_collectors_skipped(args: argparse.Namespace) -> bool:
-    if args.use_access_analyzer:
-        return False
-    return (
-        args.skip_iam
-        and args.skip_s3
-        and args.skip_ram
+    extras = (
+        args.skip_ram
         and args.skip_ami
         and args.skip_ssm
         and args.skip_credentials
     )
+    if args.use_access_analyzer:
+        return extras
+    if getattr(args, "policy_scanner", False):
+        return extras and args.skip_iam and args.skip_s3
+    return False
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2554,9 +2622,10 @@ def main(argv: list[str] | None = None) -> int:
             "--skip-iam / --skip-s3 (AA replaces those collectors).[/bold red]"
         )
         return 1
-    if args.wait_for_analyzer and not args.use_access_analyzer:
+    if args.wait_for_analyzer and getattr(args, "policy_scanner", False):
         console.print(
-            "[bold red]Error: --wait-for-analyzer requires --use-access-analyzer.[/bold red]"
+            "[bold red]Error: --wait-for-analyzer cannot be combined with "
+            "--policy-scanner.[/bold red]"
         )
         return 1
     if _all_collectors_skipped(args):
@@ -2569,16 +2638,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.region:
         session_kwargs["region_name"] = args.region
     session = boto3.Session(**session_kwargs)
-    output_format = _resolve_format(args)
 
     try:
-        backend_label = "Access Analyzer" if args.use_access_analyzer else "Policy scanner"
         console.print(
             Panel(
                 "[bold cyan]AWS Trustline[/bold cyan]\n"
-                "Map external access grants and name the vendor when the account is known.\n"
-                f"[dim]Backend:[/dim] {backend_label}    "
-                f"[dim]Output:[/dim] {output_format}",
+                "Map current external access and name the vendor when the account is known.",
                 title="AWS Trustline",
                 box=box.ROUNDED,
             )
@@ -2600,7 +2665,42 @@ def main(argv: list[str] | None = None) -> int:
         our_organization_id = fetch_organization_id(session)
         account_aliases = get_account_aliases(session)
 
-        if args.use_access_analyzer:
+        if getattr(args, "policy_scanner", False):
+            output_format = _resolve_format(args, False)
+            console.print(
+                f"[dim]Backend:[/dim] Policy scanner    [dim]Output:[/dim] {output_format}"
+            )
+            return _run_policy_scanner(
+                session=session,
+                args=args,
+                account_to_vendor=account_to_vendor,
+                trusted_accounts=trusted_accounts,
+                org_accounts=org_accounts,
+                account_aliases=account_aliases,
+                org_error=org_error,
+                output_format=output_format,
+                our_organization_id=our_organization_id,
+            )
+
+        regions = _try_resolve_regions(session, args)
+        analyzers: dict[str, dict[str, str]] = {}
+        if regions:
+            console.print(
+                f"[bold]Looking for external analyzers in {len(regions)} region(s) "
+                f"(scope: {args.scope})...[/bold]"
+            )
+            analyzers = find_external_analyzers(session, regions, args.scope)
+
+        if analyzers:
+            output_format = _resolve_format(args, True)
+            if not args.use_access_analyzer:
+                console.print(
+                    "[green]Access Analyzer found — using it for IAM/S3-class resources "
+                    "(effective access). Pass --policy-scanner to walk policies instead.[/green]"
+                )
+            console.print(
+                f"[dim]Backend:[/dim] Access Analyzer    [dim]Output:[/dim] {output_format}"
+            )
             return _run_access_analyzer_backend(
                 session=session,
                 args=args,
@@ -2611,8 +2711,36 @@ def main(argv: list[str] | None = None) -> int:
                 output_format=output_format,
                 our_organization_id=our_organization_id,
                 org_error=org_error,
+                analyzers=analyzers,
             )
 
+        if args.use_access_analyzer:
+            return _run_access_analyzer_backend(
+                session=session,
+                args=args,
+                account_to_vendor=account_to_vendor,
+                trusted_accounts=trusted_accounts,
+                org_accounts=org_accounts,
+                account_aliases=account_aliases,
+                output_format=_resolve_format(args, True),
+                our_organization_id=our_organization_id,
+                org_error=org_error,
+                analyzers={},
+            )
+
+        if args.wait_for_analyzer:
+            console.print(
+                "[yellow]--wait-for-analyzer ignored: no analyzer found; "
+                "walking IAM/S3 policies.[/yellow]"
+            )
+        output_format = _resolve_format(args, False)
+        console.print(
+            "[yellow]No external Access Analyzer in requested regions; "
+            "walking IAM/S3 policies.[/yellow]"
+        )
+        console.print(
+            f"[dim]Backend:[/dim] Policy scanner    [dim]Output:[/dim] {output_format}"
+        )
         return _run_policy_scanner(
             session=session,
             args=args,

@@ -167,6 +167,7 @@ Resources:
           REGIONS: !Ref Regions
           REPORT_BUCKET: !Ref ReportBucket
           ALERT_TOPIC_ARN: !If [EnableAlertEmail, !Ref AlertTopic, ""]
+          TRUSTLINE_CACHE_DIR: "/tmp/trustline-cache"
           # Rich auto-detects non-TTY but force plain output for CloudWatch.
           NO_COLOR: "1"
           PYTHONUNBUFFERED: "1"

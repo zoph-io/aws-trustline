@@ -242,7 +242,7 @@ def _publish_findings_alert(
         f"Regions analyzed: {len(analyzers)} ({', '.join(sorted(analyzers))})\n"
         f"Owner accounts seen: {totals.get('owner_accounts', 0)}\n\n"
         f"Public grants: {totals.get('public', 0)}\n"
-        f"Unknown principal grants: {totals.get('unknown', 0)}\n"
+        f"Unknown principal grants (not in known_aws_accounts): {totals.get('unknown', 0)}\n"
         f"Federated principals: {totals.get('federated', 0)}\n"
         f"IAM roles missing ExternalId: {totals.get('missing_external_id', 0)}\n"
         f"OIDC missing sub/aud: {totals.get('missing_oidc_subject', 0)}\n"

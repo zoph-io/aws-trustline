@@ -58,17 +58,19 @@ from grants import (
     grants_from_policy_document,
     index_known_accounts,
     is_aws_service_principal,
+    loads_policy_document,
     merge_builtin_vendors,
     oidc_condition_gaps,
     parse_principal_value,
     parties_from_grants,
+    party_totals,
     report_scope_label,
     role_name_from_resource,
     should_flag_missing_external_id,
     totals_from_grants,
 )
 
-__version__ = "0.4.1"
+__version__ = "0.4.2"
 
 REFERENCE_DATA_URL = (
     "https://raw.githubusercontent.com/fwdcloudsec/known_aws_accounts/main/accounts.yaml"
@@ -403,6 +405,252 @@ def collect_s3_bucket_grants(
     except Exception as e:
         console.print(f"[bold red]Error checking S3 bucket policies: {e}[/bold red]")
     return grants
+
+
+def _grants_from_resource_policy(
+    policy_document: dict[str, Any] | None,
+    *,
+    resource: str,
+    resource_type: str,
+    mechanism: str,
+    region: str,
+    kwargs: dict[str, Any],
+) -> list[dict[str, Any]]:
+    if not policy_document:
+        return []
+    return grants_from_policy_document(
+        policy_document,
+        resource=resource,
+        resource_type=resource_type,
+        mechanism=mechanism,
+        region=region,
+        trusted_accounts=kwargs["trusted_accounts"],
+        account_to_vendor=kwargs["account_to_vendor"],
+        current_account_id=kwargs["current_account_id"],
+        owner_account=kwargs["owner_account"],
+        owner_label=kwargs["owner_label"],
+        our_organization_id=kwargs["our_organization_id"],
+    )
+
+
+def _collect_kms_in_region(
+    session: boto3.Session, region: str, kwargs: dict[str, Any]
+) -> tuple[str, list[dict[str, Any]], str | None]:
+    grants: list[dict[str, Any]] = []
+    try:
+        client = session.client("kms", region_name=region, config=AA_CLIENT_CONFIG)
+        paginator = client.get_paginator("list_keys")
+        for page in paginator.paginate():
+            for key in page.get("Keys") or []:
+                key_id = key.get("KeyId") or ""
+                try:
+                    meta = client.describe_key(KeyId=key_id).get("KeyMetadata") or {}
+                    if meta.get("KeyManager") == "AWS":
+                        continue
+                    if meta.get("KeyState") not in ("Enabled", "Disabled"):
+                        continue
+                    arn = meta.get("Arn") or key.get("KeyArn") or key_id
+                    raw = client.get_key_policy(KeyId=key_id, PolicyName="default").get("Policy")
+                    grants.extend(
+                        _grants_from_resource_policy(
+                            loads_policy_document(raw),
+                            resource=arn,
+                            resource_type="AWS::KMS::Key",
+                            mechanism="kms_key_policy",
+                            region=region,
+                            kwargs=kwargs,
+                        )
+                    )
+                except ClientError:
+                    continue
+        return region, grants, None
+    except ClientError as e:
+        return region, [], e.response["Error"]["Message"]
+    except (BotoCoreError, Exception) as e:
+        return region, [], str(e)
+
+
+def _collect_sns_in_region(
+    session: boto3.Session, region: str, kwargs: dict[str, Any]
+) -> tuple[str, list[dict[str, Any]], str | None]:
+    grants: list[dict[str, Any]] = []
+    try:
+        client = session.client("sns", region_name=region, config=AA_CLIENT_CONFIG)
+        paginator = client.get_paginator("list_topics")
+        for page in paginator.paginate():
+            for topic in page.get("Topics") or []:
+                arn = topic.get("TopicArn") or ""
+                if not arn:
+                    continue
+                try:
+                    attrs = client.get_topic_attributes(TopicArn=arn).get("Attributes") or {}
+                    grants.extend(
+                        _grants_from_resource_policy(
+                            loads_policy_document(attrs.get("Policy")),
+                            resource=arn,
+                            resource_type="AWS::SNS::Topic",
+                            mechanism="sns_topic_policy",
+                            region=region,
+                            kwargs=kwargs,
+                        )
+                    )
+                except ClientError:
+                    continue
+        return region, grants, None
+    except ClientError as e:
+        return region, [], e.response["Error"]["Message"]
+    except (BotoCoreError, Exception) as e:
+        return region, [], str(e)
+
+
+def _collect_sqs_in_region(
+    session: boto3.Session, region: str, kwargs: dict[str, Any]
+) -> tuple[str, list[dict[str, Any]], str | None]:
+    grants: list[dict[str, Any]] = []
+    try:
+        client = session.client("sqs", region_name=region, config=AA_CLIENT_CONFIG)
+        paginator = client.get_paginator("list_queues")
+        for page in paginator.paginate():
+            for url in page.get("QueueUrls") or []:
+                try:
+                    attrs = (
+                        client.get_queue_attributes(
+                            QueueUrl=url, AttributeNames=["Policy", "QueueArn"]
+                        ).get("Attributes")
+                        or {}
+                    )
+                    arn = attrs.get("QueueArn") or url
+                    grants.extend(
+                        _grants_from_resource_policy(
+                            loads_policy_document(attrs.get("Policy")),
+                            resource=arn,
+                            resource_type="AWS::SQS::Queue",
+                            mechanism="sqs_queue_policy",
+                            region=region,
+                            kwargs=kwargs,
+                        )
+                    )
+                except ClientError:
+                    continue
+        return region, grants, None
+    except ClientError as e:
+        return region, [], e.response["Error"]["Message"]
+    except (BotoCoreError, Exception) as e:
+        return region, [], str(e)
+
+
+def _collect_lambda_in_region(
+    session: boto3.Session, region: str, kwargs: dict[str, Any]
+) -> tuple[str, list[dict[str, Any]], str | None]:
+    grants: list[dict[str, Any]] = []
+    try:
+        client = session.client("lambda", region_name=region, config=AA_CLIENT_CONFIG)
+        paginator = client.get_paginator("list_functions")
+        for page in paginator.paginate():
+            for fn in page.get("Functions") or []:
+                arn = fn.get("FunctionArn") or fn.get("FunctionName") or ""
+                name = fn.get("FunctionName") or ""
+                try:
+                    raw = client.get_policy(FunctionName=name).get("Policy")
+                except ClientError:
+                    continue
+                grants.extend(
+                    _grants_from_resource_policy(
+                        loads_policy_document(raw),
+                        resource=arn,
+                        resource_type="AWS::Lambda::Function",
+                        mechanism="lambda_resource_policy",
+                        region=region,
+                        kwargs=kwargs,
+                    )
+                )
+        return region, grants, None
+    except ClientError as e:
+        return region, [], e.response["Error"]["Message"]
+    except (BotoCoreError, Exception) as e:
+        return region, [], str(e)
+
+
+def _collect_secrets_in_region(
+    session: boto3.Session, region: str, kwargs: dict[str, Any]
+) -> tuple[str, list[dict[str, Any]], str | None]:
+    grants: list[dict[str, Any]] = []
+    try:
+        client = session.client(
+            "secretsmanager", region_name=region, config=AA_CLIENT_CONFIG
+        )
+        paginator = client.get_paginator("list_secrets")
+        for page in paginator.paginate():
+            for secret in page.get("SecretList") or []:
+                arn = secret.get("ARN") or secret.get("Name") or ""
+                name = secret.get("Name") or arn
+                try:
+                    raw = client.get_resource_policy(SecretId=name).get("ResourcePolicy")
+                except ClientError:
+                    continue
+                grants.extend(
+                    _grants_from_resource_policy(
+                        loads_policy_document(raw),
+                        resource=arn,
+                        resource_type="AWS::SecretsManager::Secret",
+                        mechanism="secretsmanager_resource_policy",
+                        region=region,
+                        kwargs=kwargs,
+                    )
+                )
+        return region, grants, None
+    except ClientError as e:
+        return region, [], e.response["Error"]["Message"]
+    except (BotoCoreError, Exception) as e:
+        return region, [], str(e)
+
+
+RESOURCE_POLICY_COLLECTORS: tuple[tuple[str, str, Any], ...] = (
+    ("KMS key policies", "KMS", _collect_kms_in_region),
+    ("SNS topic policies", "SNS", _collect_sns_in_region),
+    ("SQS queue policies", "SQS", _collect_sqs_in_region),
+    ("Lambda resource policies", "Lambda", _collect_lambda_in_region),
+    ("Secrets Manager resource policies", "Secrets", _collect_secrets_in_region),
+)
+
+
+def collect_resource_policy_grants(
+    session: boto3.Session,
+    regions: list[str],
+    **kwargs: Any,
+) -> tuple[list[dict[str, Any]], list[dict[str, str]], list[dict[str, str]]]:
+    """Walk AA-class resource policies when Access Analyzer is not used.
+
+    Allow-principal matching only (no Deny, BPA, or KMS cryptographic grants).
+    """
+    grants: list[dict[str, Any]] = []
+    scanned: list[dict[str, str]] = []
+    skipped: list[dict[str, str]] = []
+    if not regions:
+        skipped.append(
+            {
+                "surface": "KMS / SNS / SQS / Lambda / Secrets Manager policies",
+                "detail": "No region configured; pass --region / --regions / --all-regions",
+            }
+        )
+        return grants, scanned, skipped
+
+    for surface, prefix, worker in RESOURCE_POLICY_COLLECTORS:
+        console.print(
+            f"[bold blue]Checking {surface} in {len(regions)} region(s)...[/bold blue]"
+        )
+        region_grants, failures = _run_regional_collector(
+            session, regions, worker, kwargs, warning_prefix=prefix
+        )
+        grants.extend(region_grants)
+        failed_ids = {region for region, _ in failures}
+        ok_regions = [region for region in regions if region not in failed_ids]
+        if ok_regions:
+            scanned.append({"surface": surface, "detail": ", ".join(ok_regions)})
+        for region, error in failures:
+            skipped.append({"surface": f"{surface} ({region})", "detail": error})
+        console.print(f"[green]{surface}: {len(region_grants)} grant(s)[/green]")
+    return grants, scanned, skipped
 
 
 def _ram_permission_actions(
@@ -966,6 +1214,7 @@ def generate_markdown_report(
     report_file = _report_filename(output_dir, slug, "md")
     totals = totals_from_grants(grants)
     parties = parties_from_grants(grants)
+    ptotals = party_totals(parties)
 
     def _rows(predicate) -> list[dict[str, Any]]:
         return [g for g in grants if predicate(g)]
@@ -981,16 +1230,16 @@ def generate_markdown_report(
             f.write(f"Could not access AWS Organizations API: {org_error}\n\n")
         f.write("## Summary\n\n")
         f.write(
-            f"- External parties: {len(parties)}\n"
-            f"- Trusted: {totals['trusted']}\n"
-            f"- Known vendors: {totals['vendors']}\n"
-            f"- Federated (OIDC/SAML/Cognito): {totals['federated']}\n"
-            f"- Not in known_aws_accounts: {totals['unknown']}\n"
-            f"- Public: {totals['public']}\n"
-            f"- Blocked by Block Public Access: {totals['blocked_public']}\n"
-            f"- Missing ExternalId: {totals['missing_external_id']}\n"
-            f"- OIDC missing sub/aud: {totals['missing_oidc_subject']}\n"
+            f"- External parties: {ptotals['parties']}\n"
+            f"- Unknown parties: {ptotals['unknown']}\n"
+            f"- Public parties: {ptotals['public']}\n"
+            f"- Vendor parties: {ptotals['vendor']}\n"
+            f"- Federated parties: {ptotals['federated']}\n"
+            f"- Trusted parties: {ptotals['trusted']}\n"
+            f"- Missing ExternalId (grants): {totals['missing_external_id']}\n"
+            f"- OIDC missing sub/aud (grants): {totals['missing_oidc_subject']}\n"
             f"- Never-expiring service credentials: {totals['never_expires']}\n"
+            f"- Blocked by Block Public Access (grants): {totals['blocked_public']}\n"
             f"- Total grants: {totals['findings']}\n\n"
         )
         f.write(inventory)
@@ -1041,10 +1290,19 @@ def display_grants(
     current_account_alias = account_aliases.get(current_account_id, current_account_id)
     totals = totals_from_grants(grants)
     parties = parties_from_grants(grants)
+    ptotals = party_totals(parties)
 
     console.print(
         f"\n[cyan]Analyzing:[/cyan] {current_account_id} ({current_account_alias})\n"
     )
+
+    class_style = {
+        "unknown": "yellow",
+        "public": "red",
+        "vendor": "magenta",
+        "federated": "blue",
+        "trusted": "green",
+    }
 
     if parties:
         table = Table(
@@ -1053,21 +1311,18 @@ def display_grants(
         )
         table.add_column("Principal", style="cyan", overflow="fold")
         table.add_column("Name source", style="blue", overflow="fold")
-        table.add_column("Class", style="green")
+        table.add_column("Class")
         table.add_column("Grants", justify="right")
         table.add_column("Resources", overflow="fold")
         for party in parties[:50]:
-            row = (
+            klass = party["classification"]
+            table.add_row(
                 party["name"],
                 party["name_source_label"],
-                party["classification"],
+                f"[{class_style.get(klass, 'white')}]{klass}[/]",
                 str(party["grant_count"]),
                 _party_resource_summary(party),
             )
-            if party["classification"] == "unknown":
-                table.add_row(*row, style="yellow")
-            else:
-                table.add_row(*row)
         if len(parties) > 50:
             table.add_row("…", f"+{len(parties) - 50} more", "", "", "")
         console.print(table)
@@ -1115,16 +1370,16 @@ def display_grants(
     console.print(
         Panel(
             f"[bold]Summary:[/bold]\n"
-            f"[cyan]External parties:[/cyan] {len(parties)}\n"
-            f"[green]Trusted:[/green] {totals['trusted']}\n"
-            f"[cyan]Known vendors:[/cyan] {totals['vendors']}\n"
-            f"[blue]Federated:[/blue] {totals['federated']}\n"
-            f"[yellow]Not in known_aws_accounts:[/yellow] {totals['unknown']}\n"
-            f"[red]Public:[/red] {totals['public']}\n"
-            f"[dim]Blocked by BPA:[/dim] {totals['blocked_public']}\n"
-            f"[red]Missing ExternalId:[/red] {totals['missing_external_id']}\n"
-            f"[red]OIDC missing sub/aud:[/red] {totals['missing_oidc_subject']}\n"
+            f"[cyan]External parties:[/cyan] {ptotals['parties']}\n"
+            f"[yellow]Unknown parties:[/yellow] {ptotals['unknown']}\n"
+            f"[red]Public parties:[/red] {ptotals['public']}\n"
+            f"[magenta]Vendor parties:[/magenta] {ptotals['vendor']}\n"
+            f"[blue]Federated parties:[/blue] {ptotals['federated']}\n"
+            f"[green]Trusted parties:[/green] {ptotals['trusted']}\n"
+            f"[red]Missing ExternalId (grants):[/red] {totals['missing_external_id']}\n"
+            f"[red]OIDC missing sub/aud (grants):[/red] {totals['missing_oidc_subject']}\n"
             f"[red]Never-expiring credentials:[/red] {totals['never_expires']}\n"
+            f"[dim]Blocked by BPA (grants):[/dim] {totals['blocked_public']}\n"
             f"[bold]Total grants:[/bold] {totals['findings']}",
             title="AWS Trustline Results",
             box=box.ROUNDED,
@@ -1700,7 +1955,7 @@ def _classify_aa_finding(
     if is_public:
         grant["is_public"] = True
         grant["classification"] = "public"
-        grant["principal_label"] = "Everyone (public)"
+        grant["principal_label"] = "Everyone (*)"
 
     if resource_type == "AWS::IAM::Role" and not grant["is_public"] and grant.get("principal_kind") == "aws_account":
         grant["missing_external_id"] = should_flag_missing_external_id(
@@ -2020,6 +2275,16 @@ def _html_pill(label: str, kind: str = "") -> str:
     return f'<span class="{klass}">{_h(label)}</span>'
 
 
+def _party_pill_kind(classification: str) -> str:
+    return {
+        "public": "danger",
+        "unknown": "warn",
+        "vendor": "vendor",
+        "federated": "info",
+        "trusted": "success",
+    }.get(classification, "")
+
+
 def _html_classification_pill(finding: dict[str, Any]) -> str:
     classification = finding["classification"]
     if classification == "public":
@@ -2219,6 +2484,7 @@ def generate_html_report(
     """Write HTML: inventory by principal, leftover flags, coverage appendix."""
     totals = totals_from_grants(grants)
     parties = parties_from_grants(grants)
+    ptotals = party_totals(parties)
     current_account_id = (
         list(account_aliases.keys())[0] if account_aliases else "unknown"
     )
@@ -2256,14 +2522,14 @@ def generate_html_report(
     )
     kpis_html = (
         '<div class="kpis">'
-        + _render_kpi("External parties", len(parties), "Grouped by account ID or issuer")
-        + _render_kpi("Not in dataset", totals["unknown"], "Looked up, no name", danger=totals["unknown"] > 0)
-        + _render_kpi("Known vendors", totals["vendors"], "fwd:cloudsec + AWS aliases")
-        + _render_kpi("Trusted", totals["trusted"], "Org + YAML + CloudFront OAI")
-        + _render_kpi("Federated", totals["federated"], "OIDC / SAML / Cognito")
-        + _render_kpi("Public", totals["public"], "Currently public", danger=totals["public"] > 0)
-        + _render_kpi("Missing ExternalId", totals["missing_external_id"], "Confused deputy", danger=totals["missing_external_id"] > 0)
-        + _render_kpi("OIDC gaps", totals["missing_oidc_subject"], "Missing sub/aud", danger=totals["missing_oidc_subject"] > 0)
+        + _render_kpi("External parties", ptotals["parties"], "Grouped by account ID or issuer")
+        + _render_kpi("Unknown parties", ptotals["unknown"], "Looked up, no name", danger=ptotals["unknown"] > 0)
+        + _render_kpi("Public parties", ptotals["public"], "Currently shared with *", danger=ptotals["public"] > 0)
+        + _render_kpi("Vendor parties", ptotals["vendor"], "fwd:cloudsec + AWS aliases")
+        + _render_kpi("Trusted parties", ptotals["trusted"], "Org + YAML + CloudFront")
+        + _render_kpi("Federated parties", ptotals["federated"], "OIDC / SAML / Cognito")
+        + _render_kpi("Missing ExternalId", totals["missing_external_id"], "Confused deputy (grants)", danger=totals["missing_external_id"] > 0)
+        + _render_kpi("OIDC gaps", totals["missing_oidc_subject"], "Missing sub/aud (grants)", danger=totals["missing_oidc_subject"] > 0)
         + "</div>"
     )
 
@@ -2288,7 +2554,7 @@ def generate_html_report(
         "<tr>"
         f"<td>{_h(party['name'])}</td>"
         f"<td class=\"muted\">{_h(party['name_source_label'])}</td>"
-        f"<td>{_h(party['classification'])}</td>"
+        f"<td>{_html_pill(party['classification'], _party_pill_kind(party['classification']))}</td>"
         f"<td>{party['grant_count']}</td>"
         f"<td class=\"muted\">{_h(', '.join(party['mechanisms']))}</td>"
         f"<td class=\"muted\">{_h(_party_resource_summary(party))}</td>"
@@ -2417,6 +2683,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--skip-iam", action="store_true", help="Skip IAM role trust policies")
     parser.add_argument("--skip-s3", action="store_true", help="Skip S3 bucket policies")
+    parser.add_argument(
+        "--skip-resource-policies",
+        action="store_true",
+        help=(
+            "Skip KMS key, SNS, SQS, Lambda, and Secrets Manager resource policies "
+            "(policy scanner only; Access Analyzer already covers these types)"
+        ),
+    )
     parser.add_argument("--skip-ram", action="store_true", help="Skip RAM resource shares")
     parser.add_argument("--skip-ami", action="store_true", help="Skip AMI launch permissions")
     parser.add_argument("--skip-ssm", action="store_true", help="Skip SSM document shares")
@@ -2694,6 +2968,21 @@ def _run_policy_scanner(
         grants.extend(collect_s3_bucket_grants(session, **kwargs))
         scanned.append({"surface": "S3 bucket policies", "detail": "this account"})
 
+    if getattr(args, "skip_resource_policies", False):
+        skipped.append(
+            {
+                "surface": "KMS / SNS / SQS / Lambda / Secrets Manager policies",
+                "detail": "--skip-resource-policies",
+            }
+        )
+    else:
+        rp_grants, rp_scanned, rp_skipped = collect_resource_policy_grants(
+            session, regions, **kwargs
+        )
+        grants.extend(rp_grants)
+        scanned.extend(rp_scanned)
+        skipped.extend(rp_skipped)
+
     extra, extra_scanned, extra_skipped = collect_optional_scanners(
         session, args, regions, kwargs
     )
@@ -2732,7 +3021,7 @@ def _all_collectors_skipped(args: argparse.Namespace) -> bool:
     if args.use_access_analyzer:
         return extras
     if getattr(args, "policy_scanner", False):
-        return extras and args.skip_iam and args.skip_s3
+        return extras and args.skip_iam and args.skip_s3 and args.skip_resource_policies
     return False
 
 

@@ -119,6 +119,11 @@ MECHANISM_LABELS: dict[str, str] = {
     "ssm_document_share": "SSM document share",
     "service_specific_credential": "IAM service-specific credential",
     "access_analyzer": "Access Analyzer finding",
+    "kms_key_policy": "KMS key policy",
+    "sns_topic_policy": "SNS topic policy",
+    "sqs_queue_policy": "SQS queue policy",
+    "lambda_resource_policy": "Lambda resource policy",
+    "secretsmanager_resource_policy": "Secrets Manager resource policy",
 }
 
 # Where a principal's display name came from. Reports print these labels.
@@ -238,6 +243,80 @@ def flatten_condition_keys(condition: dict[str, Any] | None) -> set[str]:
             # Access Analyzer flattens to {condition_key: value}.
             keys.add(operator.lower())
     return keys
+
+
+_PRINCIPAL_BINDING_CONDITION_KEYS = frozenset(
+    {
+        "aws:sourceaccount",
+        "aws:sourcearn",
+        "aws:principalorgid",
+        "aws:principalaccount",
+        "aws:sourceowner",
+        "aws:principalarn",
+        "aws:principalorgpaths",
+        "aws:sourceorgid",
+        "kms:calleraccount",
+    }
+)
+
+
+def condition_binds_principal(condition: dict[str, Any] | None) -> bool:
+    """True when a Condition names who may use a Principal:* (not the public)."""
+    keys = flatten_condition_keys(condition)
+    return any(
+        k in _PRINCIPAL_BINDING_CONDITION_KEYS or k.split(":")[-1] in {
+            "sourceaccount",
+            "sourcearn",
+            "principalorgid",
+            "principalaccount",
+            "sourceowner",
+            "principalarn",
+            "principalorgpaths",
+            "sourceorgid",
+            "calleraccount",
+        }
+        for k in keys
+    )
+
+
+def _condition_values_for_key(condition: dict[str, Any] | None, wanted: str) -> list[str]:
+    if not condition or not isinstance(condition, dict):
+        return []
+    wanted = wanted.lower()
+    out: list[str] = []
+    for operator, values in condition.items():
+        if isinstance(values, dict):
+            for inner_key, inner_val in values.items():
+                if isinstance(inner_key, str) and inner_key.lower() == wanted:
+                    if isinstance(inner_val, list):
+                        out.extend(str(v) for v in inner_val)
+                    elif inner_val is not None:
+                        out.append(str(inner_val))
+        elif isinstance(operator, str) and operator.lower() == wanted:
+            if isinstance(values, list):
+                out.extend(str(v) for v in values)
+            elif values is not None:
+                out.append(str(values))
+    return out
+
+
+def source_account_from_condition(condition: dict[str, Any] | None) -> str | None:
+    """12-digit account from SourceAccount / PrincipalAccount / SourceArn, if any."""
+    for key in (
+        "aws:SourceAccount",
+        "aws:PrincipalAccount",
+        "kms:CallerAccount",
+        "aws:SourceOwner",
+    ):
+        for raw in _condition_values_for_key(condition, key):
+            value = raw.strip()
+            if ACCOUNT_ID_PATTERN.match(value):
+                return value
+    for raw in _condition_values_for_key(condition, "aws:SourceArn"):
+        extracted = extract_account_id_from_iam_value(raw.strip())
+        if extracted:
+            return extracted
+    return None
 
 
 def statement_has_external_id(condition: dict[str, Any] | None) -> bool:
@@ -898,6 +977,16 @@ def grant_from_parsed_principal(
     actions: list[str] | None = None,
 ) -> dict[str, Any] | None:
     """Build one grant row, or None if this principal is the current account."""
+    condition = (statement or {}).get("Condition") or {}
+    if not isinstance(condition, dict):
+        condition = {}
+    if parsed.get("is_public") and condition_binds_principal(condition):
+        source_acct = source_account_from_condition(condition)
+        if not source_acct:
+            # Principal:* + SourceArn/OrgId without an account ID is not public
+            # access; it is a service notification pattern we cannot name.
+            return None
+        parsed = parse_principal_value("AWS", source_acct)
     if is_same_account_principal(parsed, current_account_id):
         return None
     classification, vendor, trusted = classify_parsed_principal(
@@ -906,7 +995,6 @@ def grant_from_parsed_principal(
         account_to_vendor=account_to_vendor,
         current_account_id=current_account_id,
     )
-    condition = (statement or {}).get("Condition") or {}
     missing_external_id = should_flag_missing_external_id(
         resource_type=resource_type,
         mechanism=mechanism,
@@ -1025,6 +1113,43 @@ def actions_from_ram_permission(permission_doc: Any) -> list[str]:
     return list(dict.fromkeys(actions))
 
 
+def loads_policy_document(raw: Any) -> dict[str, Any] | None:
+    """Parse a resource-policy payload that APIs return as dict or JSON string."""
+    if not raw:
+        return None
+    if isinstance(raw, str):
+        raw = raw.strip()
+        if not raw:
+            return None
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+    if isinstance(raw, dict):
+        return raw
+    return None
+
+
+def party_totals(parties: Iterable[dict[str, Any]]) -> dict[str, int]:
+    """Count external parties by classification (not grant rows)."""
+    totals = {
+        "parties": 0,
+        "unknown": 0,
+        "public": 0,
+        "vendor": 0,
+        "federated": 0,
+        "trusted": 0,
+    }
+    for party in parties:
+        totals["parties"] += 1
+        classification = party.get("classification") or "unknown"
+        if classification in totals:
+            totals[classification] += 1
+        else:
+            totals["unknown"] += 1
+    return totals
+
+
 def totals_from_grants(grants: Iterable[dict[str, Any]]) -> dict[str, int]:
     totals = {
         "trusted": 0,
@@ -1082,8 +1207,11 @@ def build_coverage(
         not_scanned.insert(
             0,
             {
-                "surface": "KMS grants, S3 ACLs, and other Access Analyzer types",
-                "detail": "Policy scanner does not evaluate these; use --use-access-analyzer",
+                "surface": "KMS cryptographic grants (ListGrants), S3 ACLs, ECR/EFS/RDS snapshots",
+                "detail": (
+                    "Key/topic/queue/function/secret policies are scanned. "
+                    "KMS grants and remaining AA types need Access Analyzer."
+                ),
             },
         )
         not_scanned.insert(
@@ -1092,7 +1220,8 @@ def build_coverage(
                 "surface": "Deny statements and most conditions",
                 "detail": (
                     "Policy scanner is Allow-principal matching. Public S3 rows "
-                    "are checked with GetBucketPolicyStatus (Block Public Access)."
+                    "are checked with GetBucketPolicyStatus (Block Public Access). "
+                    "Principal:* with aws:SourceAccount/SourceArn is not treated as public."
                 ),
             },
         )

@@ -17,10 +17,12 @@ from grants import (
     grant_resource_label,
     grants_from_policy_document,
     index_known_accounts,
+    loads_policy_document,
     merge_builtin_vendors,
     oidc_condition_gaps,
     parse_principal_value,
     parties_from_grants,
+    party_totals,
     report_scope_label,
     totals_from_grants,
     dedupe_access_analyzer_grants,
@@ -246,6 +248,73 @@ class TrustPolicyGrantTests(unittest.TestCase):
         self.assertEqual(grants[0]["classification"], "public")
         self.assertTrue(grants[0]["is_public"])
 
+    def test_sns_star_with_same_account_source_is_not_public(self):
+        grants = grants_from_policy_document(
+            {
+                "Statement": {
+                    "Effect": "Allow",
+                    "Principal": {"AWS": "*"},
+                    "Action": "SNS:Publish",
+                    "Condition": {
+                        "StringEquals": {"AWS:SourceAccount": "111122223333"},
+                        "ArnLike": {"AWS:SourceArn": "arn:aws:s3:::example-bucket"},
+                    },
+                }
+            },
+            resource="arn:aws:sns:eu-west-1:111122223333:events",
+            resource_type="AWS::SNS::Topic",
+            mechanism="sns_topic_policy",
+            trusted_accounts={},
+            account_to_vendor={},
+            current_account_id="111122223333",
+        )
+        self.assertEqual(grants, [])
+
+    def test_sns_star_with_foreign_source_account_is_that_account(self):
+        grants = grants_from_policy_document(
+            {
+                "Statement": {
+                    "Effect": "Allow",
+                    "Principal": "*",
+                    "Action": "SNS:Publish",
+                    "Condition": {"StringEquals": {"aws:SourceAccount": "444455556666"}},
+                }
+            },
+            resource="arn:aws:sns:eu-west-1:111122223333:events",
+            resource_type="AWS::SNS::Topic",
+            mechanism="sns_topic_policy",
+            trusted_accounts={},
+            account_to_vendor={},
+            current_account_id="111122223333",
+        )
+        self.assertEqual(len(grants), 1)
+        self.assertFalse(grants[0]["is_public"])
+        self.assertEqual(grants[0]["principal_account_id"], "444455556666")
+        self.assertEqual(grants[0]["classification"], "unknown")
+
+    def test_star_with_source_arn_only_is_not_public(self):
+        grants = grants_from_policy_document(
+            {
+                "Statement": {
+                    "Effect": "Allow",
+                    "Principal": "*",
+                    "Action": "lambda:InvokeFunction",
+                    "Condition": {
+                        "ArnLike": {
+                            "AWS:SourceArn": "arn:aws:events:eu-west-1:111122223333:rule/x"
+                        }
+                    },
+                }
+            },
+            resource="arn:aws:lambda:eu-west-1:111122223333:function:fn",
+            resource_type="AWS::Lambda::Function",
+            mechanism="lambda_resource_policy",
+            trusted_accounts={},
+            account_to_vendor={},
+            current_account_id="111122223333",
+        )
+        self.assertEqual(grants, [])
+
     def test_github_oidc_is_federated_not_self(self):
         policy = {
             "Statement": {
@@ -406,6 +475,50 @@ class TotalsTests(unittest.TestCase):
         self.assertEqual(totals["missing_external_id"], 1)
         self.assertEqual(totals["never_expires"], 1)
         self.assertEqual(totals["findings"], 5)
+
+
+class PartyTotalsTests(unittest.TestCase):
+    def test_counts_parties_not_grants(self):
+        grants = grants_from_policy_document(
+            {
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Principal": {"AWS": "333333333333"},
+                        "Action": "sts:AssumeRole",
+                    },
+                    {
+                        "Effect": "Allow",
+                        "Principal": {"AWS": "333333333333"},
+                        "Action": "kms:Decrypt",
+                    },
+                ]
+            },
+            resource="arn:aws:kms:eu-west-1:111122223333:key/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+            resource_type="AWS::KMS::Key",
+            mechanism="kms_key_policy",
+            trusted_accounts={},
+            account_to_vendor={"333333333333": {"name": "Datadog"}},
+            current_account_id="111122223333",
+        )
+        parties = parties_from_grants(grants)
+        ptotals = party_totals(parties)
+        self.assertEqual(len(grants), 2)
+        self.assertEqual(ptotals["parties"], 1)
+        self.assertEqual(ptotals["vendor"], 1)
+        self.assertEqual(ptotals["unknown"], 0)
+
+
+class PolicyDocumentParseTests(unittest.TestCase):
+    def test_loads_json_string(self):
+        doc = loads_policy_document(
+            '{"Statement":{"Effect":"Allow","Principal":"*","Action":"kms:Decrypt"}}'
+        )
+        self.assertEqual(doc["Statement"]["Principal"], "*")
+
+    def test_loads_empty_is_none(self):
+        self.assertIsNone(loads_policy_document(""))
+        self.assertIsNone(loads_policy_document(None))
 
 
 class NameLookupTests(unittest.TestCase):

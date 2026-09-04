@@ -16,6 +16,7 @@ Usage:
     python trustline.py --all-regions --format both
     python trustline.py --policy-scanner
     python trustline.py --use-access-analyzer --wait-for-analyzer
+    python trustline.py --format csv
 """
 
 from __future__ import annotations
@@ -47,9 +48,12 @@ from grants import (
     actions_from_ram_permission,
     apply_live_trust_conditions,
     apply_s3_effective_public,
+    aws_console_url,
     build_coverage,
     choose_external_analyzer,
+    classification_reason,
     clear_unproven_aa_condition_flags,
+    condition_summary,
     dedupe_access_analyzer_grants,
     empty_grant,
     flatten_condition_keys,
@@ -57,12 +61,16 @@ from grants import (
     grant_resource_label,
     grants_from_policy_document,
     index_known_accounts,
+    inventory_csv,
     is_aws_service_principal,
+    leftover_flags,
     loads_policy_document,
     merge_builtin_vendors,
     oidc_condition_gaps,
     parse_principal_value,
     parties_from_grants,
+    party_details_markdown,
+    party_fixes,
     party_totals,
     report_scope_label,
     role_name_from_resource,
@@ -70,7 +78,7 @@ from grants import (
     totals_from_grants,
 )
 
-__version__ = "0.4.5"
+__version__ = "0.5.0"
 
 REFERENCE_DATA_URL = (
     "https://raw.githubusercontent.com/fwdcloudsec/known_aws_accounts/main/accounts.yaml"
@@ -407,6 +415,10 @@ def collect_s3_bucket_grants(
     return grants
 
 
+def _client_error_code(error: ClientError) -> str:
+    return str((error.response.get("Error") or {}).get("Code") or "")
+
+
 def _grants_from_resource_policy(
     policy_document: dict[str, Any] | None,
     *,
@@ -738,17 +750,6 @@ def _collect_ecr_in_region(
         return region, [], str(e)
 
 
-RESOURCE_POLICY_COLLECTORS: tuple[tuple[str, str, Any], ...] = (
-    ("KMS key policies and grants", "KMS", _collect_kms_in_region),
-    ("SNS topic policies", "SNS", _collect_sns_in_region),
-    ("SQS queue policies", "SQS", _collect_sqs_in_region),
-    ("Lambda resource policies", "Lambda", _collect_lambda_in_region),
-    ("Lambda layer permissions", "Lambda layers", _collect_lambda_layers_in_region),
-    ("Secrets Manager resource policies", "Secrets", _collect_secrets_in_region),
-    ("ECR repository policies", "ECR", _collect_ecr_in_region),
-)
-
-
 def _collect_eventbridge_in_region(
     session: boto3.Session, region: str, kwargs: dict[str, Any]
 ) -> tuple[str, list[dict[str, Any]], str | None]:
@@ -855,11 +856,358 @@ def _collect_opensearch_in_region(
         return region, [], str(e)
 
 
+def _collect_efs_in_region(
+    session: boto3.Session, region: str, kwargs: dict[str, Any]
+) -> tuple[str, list[dict[str, Any]], str | None]:
+    grants: list[dict[str, Any]] = []
+    try:
+        client = session.client("efs", region_name=region, config=AA_CLIENT_CONFIG)
+        paginator = client.get_paginator("describe_file_systems")
+        for page in paginator.paginate():
+            for fs in page.get("FileSystems") or []:
+                fs_id = fs.get("FileSystemId") or ""
+                arn = fs.get("FileSystemArn") or fs_id
+                try:
+                    raw = client.describe_file_system_policy(FileSystemId=fs_id).get(
+                        "Policy"
+                    )
+                except ClientError as e:
+                    if _client_error_code(e) in ("PolicyNotFound", "FileSystemNotFound"):
+                        continue
+                    continue
+                grants.extend(
+                    _grants_from_resource_policy(
+                        loads_policy_document(raw),
+                        resource=arn,
+                        resource_type="AWS::EFS::FileSystem",
+                        mechanism="efs_file_system_policy",
+                        region=region,
+                        kwargs=kwargs,
+                    )
+                )
+        return region, grants, None
+    except ClientError as e:
+        return region, [], e.response["Error"]["Message"]
+    except (BotoCoreError, Exception) as e:
+        return region, [], str(e)
+
+
+def _dynamodb_policy_grants(
+    client: Any,
+    arn: str,
+    resource_type: str,
+    region: str,
+    kwargs: dict[str, Any],
+) -> list[dict[str, Any]]:
+    try:
+        raw = client.get_resource_policy(ResourceArn=arn).get("Policy")
+    except ClientError as e:
+        if _client_error_code(e) in (
+            "PolicyNotFoundException",
+            "ResourceNotFoundException",
+            "ResourceNotFound",
+        ):
+            return []
+        return []
+    return _grants_from_resource_policy(
+        loads_policy_document(raw),
+        resource=arn,
+        resource_type=resource_type,
+        mechanism="dynamodb_resource_policy",
+        region=region,
+        kwargs=kwargs,
+    )
+
+
+def _collect_dynamodb_in_region(
+    session: boto3.Session, region: str, kwargs: dict[str, Any]
+) -> tuple[str, list[dict[str, Any]], str | None]:
+    grants: list[dict[str, Any]] = []
+    try:
+        client = session.client("dynamodb", region_name=region, config=AA_CLIENT_CONFIG)
+        account = kwargs.get("current_account_id") or ""
+        tables: list[str] = []
+        for page in client.get_paginator("list_tables").paginate():
+            tables.extend(page.get("TableNames") or [])
+        for name in tables:
+            arn = f"arn:aws:dynamodb:{region}:{account}:table/{name}"
+            grants.extend(
+                _dynamodb_policy_grants(
+                    client, arn, "AWS::DynamoDB::Table", region, kwargs
+                )
+            )
+        try:
+            streams_client = session.client(
+                "dynamodbstreams", region_name=region, config=AA_CLIENT_CONFIG
+            )
+            stream_arns: list[str] = []
+            token: str | None = None
+            while True:
+                req: dict[str, Any] = {}
+                if token:
+                    req["ExclusiveStartStreamArn"] = token
+                resp = streams_client.list_streams(**req)
+                for item in resp.get("Streams") or []:
+                    arn = item.get("StreamArn") or ""
+                    if arn:
+                        stream_arns.append(arn)
+                token = resp.get("LastEvaluatedStreamArn")
+                if not token:
+                    break
+            for arn in stream_arns:
+                grants.extend(
+                    _dynamodb_policy_grants(
+                        client, arn, "AWS::DynamoDB::Stream", region, kwargs
+                    )
+                )
+        except ClientError:
+            pass
+        return region, grants, None
+    except ClientError as e:
+        return region, [], e.response["Error"]["Message"]
+    except (BotoCoreError, Exception) as e:
+        return region, [], str(e)
+
+
+def _ebs_snapshot_share_grants(
+    ec2: Any, snapshot: dict[str, Any], region: str, kwargs: dict[str, Any]
+) -> list[dict[str, Any]]:
+    snap_id = snapshot.get("SnapshotId") or ""
+    owner = snapshot.get("OwnerId") or kwargs.get("current_account_id") or ""
+    arn = f"arn:aws:ec2:{region}:{owner}:snapshot/{snap_id}" if owner else snap_id
+    try:
+        attr = ec2.describe_snapshot_attribute(
+            SnapshotId=snap_id, Attribute="createVolumePermission"
+        )
+    except ClientError:
+        return []
+    grants: list[dict[str, Any]] = []
+    for perm in attr.get("CreateVolumePermissions") or []:
+        if (perm.get("Group") or "").lower() == "all":
+            principal = "*"
+        elif perm.get("UserId"):
+            principal = perm["UserId"]
+        else:
+            continue
+        row = _grant_from_principal_string(
+            principal,
+            resource=arn,
+            resource_type="AWS::EC2::Snapshot",
+            mechanism="ebs_snapshot_share",
+            region=region,
+            kwargs=kwargs,
+            actions=["ec2:CreateVolume"],
+        )
+        if row:
+            grants.append(row)
+    return grants
+
+
+def _collect_ebs_snapshots_in_region(
+    session: boto3.Session, region: str, kwargs: dict[str, Any]
+) -> tuple[str, list[dict[str, Any]], str | None]:
+    grants: list[dict[str, Any]] = []
+    try:
+        ec2 = session.client("ec2", region_name=region, config=AA_CLIENT_CONFIG)
+        snapshots: list[dict[str, Any]] = []
+        pager = ec2.get_paginator("describe_snapshots")
+        for page in pager.paginate(OwnerIds=["self"]):
+            snapshots.extend(page.get("Snapshots") or [])
+        if not snapshots:
+            return region, [], None
+        workers = min(8, max(1, len(snapshots)))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [
+                pool.submit(_ebs_snapshot_share_grants, ec2, snap, region, kwargs)
+                for snap in snapshots
+            ]
+            for future in as_completed(futures):
+                grants.extend(future.result())
+        return region, grants, None
+    except ClientError as e:
+        return region, [], e.response["Error"]["Message"]
+    except (BotoCoreError, Exception) as e:
+        return region, [], str(e)
+
+
+def _rds_restore_attribute_grants(
+    *,
+    attributes: list[dict[str, Any]],
+    resource: str,
+    resource_type: str,
+    mechanism: str,
+    region: str,
+    kwargs: dict[str, Any],
+    actions: list[str],
+) -> list[dict[str, Any]]:
+    grants: list[dict[str, Any]] = []
+    for attr in attributes:
+        if (attr.get("AttributeName") or "").lower() != "restore":
+            continue
+        for value in attr.get("AttributeValues") or []:
+            if not isinstance(value, str) or not value:
+                continue
+            principal = "*" if value.lower() == "all" else value
+            row = _grant_from_principal_string(
+                principal,
+                resource=resource,
+                resource_type=resource_type,
+                mechanism=mechanism,
+                region=region,
+                kwargs=kwargs,
+                actions=actions,
+            )
+            if row:
+                grants.append(row)
+    return grants
+
+
+def _collect_rds_snapshots_in_region(
+    session: boto3.Session, region: str, kwargs: dict[str, Any]
+) -> tuple[str, list[dict[str, Any]], str | None]:
+    grants: list[dict[str, Any]] = []
+    try:
+        client = session.client("rds", region_name=region, config=AA_CLIENT_CONFIG)
+        snapshots: list[dict[str, Any]] = []
+        for page in client.get_paginator("describe_db_snapshots").paginate(
+            SnapshotType="manual"
+        ):
+            snapshots.extend(page.get("DBSnapshots") or [])
+        for snap in snapshots:
+            ident = snap.get("DBSnapshotIdentifier") or ""
+            arn = snap.get("DBSnapshotArn") or ident
+            try:
+                result = client.describe_db_snapshot_attributes(
+                    DBSnapshotIdentifier=ident
+                )
+            except ClientError:
+                continue
+            attrs = (
+                (result.get("DBSnapshotAttributesResult") or {}).get(
+                    "DBSnapshotAttributes"
+                )
+                or []
+            )
+            grants.extend(
+                _rds_restore_attribute_grants(
+                    attributes=attrs,
+                    resource=arn,
+                    resource_type="AWS::RDS::DBSnapshot",
+                    mechanism="rds_snapshot_share",
+                    region=region,
+                    kwargs=kwargs,
+                    actions=["rds:RestoreDBInstanceFromDBSnapshot"],
+                )
+            )
+        cluster_snaps: list[dict[str, Any]] = []
+        for page in client.get_paginator("describe_db_cluster_snapshots").paginate(
+            SnapshotType="manual"
+        ):
+            cluster_snaps.extend(page.get("DBClusterSnapshots") or [])
+        for snap in cluster_snaps:
+            ident = snap.get("DBClusterSnapshotIdentifier") or ""
+            arn = snap.get("DBClusterSnapshotArn") or ident
+            try:
+                result = client.describe_db_cluster_snapshot_attributes(
+                    DBClusterSnapshotIdentifier=ident
+                )
+            except ClientError:
+                continue
+            attrs = (
+                (result.get("DBClusterSnapshotAttributesResult") or {}).get(
+                    "DBClusterSnapshotAttributes"
+                )
+                or []
+            )
+            grants.extend(
+                _rds_restore_attribute_grants(
+                    attributes=attrs,
+                    resource=arn,
+                    resource_type="AWS::RDS::DBClusterSnapshot",
+                    mechanism="rds_cluster_snapshot_share",
+                    region=region,
+                    kwargs=kwargs,
+                    actions=["rds:RestoreDBClusterFromSnapshot"],
+                )
+            )
+        return region, grants, None
+    except ClientError as e:
+        return region, [], e.response["Error"]["Message"]
+    except (BotoCoreError, Exception) as e:
+        return region, [], str(e)
+
+
+def _collect_privatelink_in_region(
+    session: boto3.Session, region: str, kwargs: dict[str, Any]
+) -> tuple[str, list[dict[str, Any]], str | None]:
+    grants: list[dict[str, Any]] = []
+    try:
+        ec2 = session.client("ec2", region_name=region, config=AA_CLIENT_CONFIG)
+        services: list[dict[str, Any]] = []
+        for page in ec2.get_paginator(
+            "describe_vpc_endpoint_service_configurations"
+        ).paginate():
+            services.extend(page.get("ServiceConfigurations") or [])
+        for svc in services:
+            sid = svc.get("ServiceId") or ""
+            if not sid or (svc.get("ServiceState") or "").lower() == "deleted":
+                continue
+            try:
+                pager = ec2.get_paginator("describe_vpc_endpoint_service_permissions")
+                principals: list[dict[str, Any]] = []
+                for page in pager.paginate(ServiceId=sid):
+                    principals.extend(page.get("AllowedPrincipals") or [])
+            except ClientError:
+                continue
+            for entry in principals:
+                ptype = entry.get("PrincipalType") or ""
+                value = (entry.get("Principal") or "").strip()
+                if ptype == "Service":
+                    continue
+                if ptype == "All" or value == "*":
+                    principal = "*"
+                elif value:
+                    principal = value
+                else:
+                    continue
+                row = _grant_from_principal_string(
+                    principal,
+                    resource=sid,
+                    resource_type="AWS::EC2::VPCEndpointService",
+                    mechanism="privatelink_allowed_principal",
+                    region=region,
+                    kwargs=kwargs,
+                    actions=["ec2:CreateVpcEndpoint"],
+                )
+                if row:
+                    grants.append(row)
+        return region, grants, None
+    except ClientError as e:
+        return region, [], e.response["Error"]["Message"]
+    except (BotoCoreError, Exception) as e:
+        return region, [], str(e)
+
+
+RESOURCE_POLICY_COLLECTORS: tuple[tuple[str, str, Any], ...] = (
+    ("KMS key policies and grants", "KMS", _collect_kms_in_region),
+    ("SNS topic policies", "SNS", _collect_sns_in_region),
+    ("SQS queue policies", "SQS", _collect_sqs_in_region),
+    ("Lambda resource policies", "Lambda", _collect_lambda_in_region),
+    ("Lambda layer permissions", "Lambda layers", _collect_lambda_layers_in_region),
+    ("Secrets Manager resource policies", "Secrets", _collect_secrets_in_region),
+    ("ECR repository policies", "ECR", _collect_ecr_in_region),
+    ("EFS file system policies", "EFS", _collect_efs_in_region),
+    ("DynamoDB table and stream policies", "DynamoDB", _collect_dynamodb_in_region),
+    ("EBS snapshot create-volume permissions", "EBS snapshots", _collect_ebs_snapshots_in_region),
+    ("RDS snapshot restore attributes", "RDS snapshots", _collect_rds_snapshots_in_region),
+)
+
 # Surfaces IAM Access Analyzer does not reason about. Run on both backends.
 BEYOND_AA_COLLECTORS: tuple[tuple[str, str, Any], ...] = (
     ("EventBridge bus policies", "EventBridge", _collect_eventbridge_in_region),
     ("Glue Data Catalog resource policies", "Glue", _collect_glue_in_region),
     ("OpenSearch domain access policies", "OpenSearch", _collect_opensearch_in_region),
+    ("PrivateLink allowed principals", "PrivateLink", _collect_privatelink_in_region),
 )
 
 
@@ -872,6 +1220,7 @@ def collect_resource_policy_grants(
 
     Allow-principal matching. Customer-managed KMS keys also run ListGrants
     (Access Analyzer already reasons about key policies *and* grants).
+    Also walks EFS/DynamoDB resource policies and EBS/RDS snapshot shares.
     """
     grants: list[dict[str, Any]] = []
     scanned: list[dict[str, str]] = []
@@ -880,7 +1229,8 @@ def collect_resource_policy_grants(
         skipped.append(
             {
                 "surface": (
-                    "KMS / SNS / SQS / Lambda / Lambda layer / Secrets / ECR policies"
+                    "KMS / SNS / SQS / Lambda / Lambda layer / Secrets / ECR / "
+                    "EFS / DynamoDB policies and EBS/RDS snapshot shares"
                 ),
                 "detail": "No region configured; pass --region / --regions / --all-regions",
             }
@@ -917,7 +1267,7 @@ def collect_beyond_aa_grants(
     if not regions:
         skipped.append(
             {
-                "surface": "EventBridge / Glue / OpenSearch resource policies",
+                "surface": "EventBridge / Glue / OpenSearch / PrivateLink",
                 "detail": "No region configured; pass --region / --regions / --all-regions",
             }
         )
@@ -1335,7 +1685,7 @@ def collect_optional_scanners(
     regions: list[str],
     kwargs: dict[str, Any],
 ) -> tuple[list[dict[str, Any]], list[dict[str, str]], list[dict[str, str]]]:
-    """RAM / AMI / SSM / credentials / EventBridge / Glue / OpenSearch collectors shared by both backends."""
+    """RAM / AMI / SSM / credentials / EventBridge / Glue / OpenSearch / PrivateLink collectors shared by both backends."""
     grants: list[dict[str, Any]] = []
     scanned: list[dict[str, str]] = []
     skipped: list[dict[str, str]] = []
@@ -1538,6 +1888,7 @@ def generate_markdown_report(
             f"- Total grants: {totals['findings']}\n\n"
         )
         f.write(inventory)
+        f.write(party_details_markdown(parties))
 
         def write_grant_table(title: str, items: list[dict[str, Any]]) -> None:
             if not items:
@@ -2542,6 +2893,55 @@ tbody tr:hover { background: rgba(39, 39, 42, 0.5); }
   color: var(--text);
   border-color: var(--accent);
 }
+.filter-bar .export-group { margin-left: auto; display: flex; gap: 8px; }
+.filter-bar input[type="search"] {
+  font-family: var(--mono);
+  font-size: 12px;
+  background: var(--bg-elev);
+  color: var(--text);
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  padding: 4px 10px;
+  min-width: 220px;
+  flex: 1 1 180px;
+  max-width: 320px;
+}
+.filter-bar input[type="search"]::placeholder { color: var(--text-dim); }
+button.expand {
+  font-family: var(--mono);
+  font-size: 10px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 0.08em;
+  background: transparent;
+  color: var(--accent-text);
+  border: 1px solid var(--accent-border);
+  border-radius: 4px;
+  padding: 2px 8px;
+  cursor: pointer;
+  margin-right: 8px;
+}
+button.expand[aria-expanded="true"] { color: var(--text); }
+tr.party-detail td {
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+  padding: 0 20px 20px;
+}
+.party-detail-inner { padding-top: 8px; }
+.party-detail-inner h3 {
+  font-family: var(--mono);
+  font-size: 11px; font-weight: 700;
+  text-transform: uppercase; letter-spacing: 0.12em;
+  color: var(--text-muted);
+  margin: 16px 0 8px;
+}
+.party-detail-inner p, .party-detail-inner li {
+  font-size: 13px; color: var(--text);
+  max-width: 72ch;
+}
+.party-detail-inner ul { margin: 0; padding-left: 18px; }
+.party-detail-inner a { color: var(--info); }
+.grant-mini { width: 100%; margin-top: 8px; }
+.grant-mini th, .grant-mini td { padding: 8px 10px; font-size: 12px; }
+tbody tr.party-row:hover { background: rgba(39, 39, 42, 0.5); }
 .footer {
   padding: 32px 0 48px;
   color: var(--text-dim);
@@ -2710,8 +3110,122 @@ def _inventory_filter_bar(parties: list[dict[str, Any]]) -> str:
     return (
         '<div class="filter-bar" id="class-filter" role="toolbar" '
         'aria-label="Filter by classification">'
-        f"{''.join(buttons)}</div>"
+        f"{''.join(buttons)}"
+        '<input type="search" id="party-search" placeholder="Search principals and resources" '
+        'aria-label="Search principals and resources">'
+        '<span class="export-group">'
+        '<button type="button" id="export-csv">Export CSV</button>'
+        '<button type="button" id="export-md">Export Markdown</button>'
+        "</span></div>"
     )
+
+
+_PARTY_INVENTORY_COLUMNS = [
+    "Principal",
+    "Name source",
+    "Classification",
+    "Grants",
+    "Mechanisms",
+    "Resources",
+]
+
+
+def _party_search_haystack(party: dict[str, Any]) -> str:
+    bits = [
+        party.get("name") or "",
+        party.get("classification") or "",
+        party.get("name_source_label") or "",
+        " ".join(party.get("mechanisms") or []),
+        _party_resource_summary(party, limit=50),
+    ]
+    for grant in party.get("grants") or []:
+        bits.append(grant.get("resource") or "")
+        bits.append(grant.get("resource_type") or "")
+        bits.append(grant_resource_label(grant))
+    return " ".join(bits).lower()
+
+
+def _party_grant_detail_rows(party: dict[str, Any]) -> str:
+    rows: list[str] = []
+    for grant in party.get("grants") or []:
+        url = aws_console_url(grant)
+        console = (
+            f'<a href="{_h(url)}" target="_blank" rel="noopener noreferrer">console</a>'
+            if url
+            else '<span class="dim">—</span>'
+        )
+        flags = leftover_flags(grant)
+        flag_html = (
+            "".join(f'<span class="tag">{_h(flag)}</span>' for flag in flags)
+            if flags
+            else '<span class="dim">—</span>'
+        )
+        cond = condition_summary(grant)
+        rows.append(
+            "<tr>"
+            f"<td class=\"mono\">{_h(grant.get('resource') or '')}</td>"
+            f"<td class=\"muted\">{_h(grant.get('resource_type') or '')}</td>"
+            f"<td class=\"muted\">{_h(grant.get('region') or '')}</td>"
+            f"<td class=\"muted\">{_h(MECHANISM_LABELS.get(grant.get('mechanism') or '', grant.get('mechanism') or ''))}</td>"
+            f"<td>{_html_actions_cell(grant.get('actions') or [])}</td>"
+            f"<td class=\"mono muted\">{_h(cond) if cond else '—'}</td>"
+            f"<td><div class=\"tags\">{flag_html}</div></td>"
+            f"<td>{console}</td>"
+            "</tr>"
+        )
+    if not rows:
+        return (
+            '<tr><td colspan="8" class="muted">No grant rows for this principal.</td></tr>'
+        )
+    return "".join(rows)
+
+
+def _party_detail_html(party: dict[str, Any], party_id: str) -> str:
+    fixes = party_fixes(party)
+    fix_items = "".join(f"<li>{_h(line)}</li>" for line in fixes) or (
+        "<li>Remove or restrict this principal on the listed resources.</li>"
+    )
+    return (
+        f'<tr class="party-detail" id="{_h(party_id)}-detail" hidden data-party="{_h(party_id)}">'
+        f'<td colspan="{len(_PARTY_INVENTORY_COLUMNS)}">'
+        '<div class="party-detail-inner">'
+        "<h3>Why this classification</h3>"
+        f"<p>{_h(classification_reason(party))}</p>"
+        "<h3>How to fix</h3>"
+        f"<ul>{fix_items}</ul>"
+        "<h3>Resources involved</h3>"
+        '<table class="grant-mini"><thead><tr>'
+        "<th>Resource</th><th>Type</th><th>Region</th><th>Mechanism</th>"
+        "<th>Actions</th><th>Condition</th><th>Flags</th><th></th>"
+        "</tr></thead><tbody>"
+        f"{_party_grant_detail_rows(party)}"
+        "</tbody></table>"
+        "</div></td></tr>"
+    )
+
+
+def _party_inventory_rows(parties: list[dict[str, Any]]) -> str:
+    chunks: list[str] = []
+    for index, party in enumerate(parties, start=1):
+        party_id = f"party-{index}"
+        klass = party.get("classification") or "unknown"
+        chunks.append(
+            f'<tr class="party-row" id="{_h(party_id)}" '
+            f'data-class="{_h(klass)}" data-search="{_h(_party_search_haystack(party))}">'
+            "<td>"
+            f'<button type="button" class="expand" aria-expanded="false" '
+            f'aria-controls="{_h(party_id)}-detail">Details</button>'
+            f"{_h(party['name'])}"
+            "</td>"
+            f"<td class=\"muted\">{_h(party['name_source_label'])}</td>"
+            f"<td>{_html_pill(klass, _party_pill_kind(klass))}</td>"
+            f"<td>{party['grant_count']}</td>"
+            f"<td class=\"muted\">{_h(', '.join(party['mechanisms']))}</td>"
+            f"<td class=\"muted\">{_h(_party_resource_summary(party))}</td>"
+            "</tr>"
+        )
+        chunks.append(_party_detail_html(party, party_id))
+    return "".join(chunks)
 
 
 def _render_section(
@@ -2749,7 +3263,18 @@ def _render_section(
     )
 
 
-def _html_document(*, title: str, header_html: str, body_html: str) -> str:
+def _html_document(
+    *,
+    title: str,
+    header_html: str,
+    body_html: str,
+    export_csv: str = "",
+    export_md: str = "",
+) -> str:
+    export_json = json.dumps(
+        {"csv": export_csv, "md": export_md},
+        ensure_ascii=False,
+    ).replace("<", "\\u003c")
     return (
         "<!DOCTYPE html>\n"
         '<html lang="en">\n<head>\n'
@@ -2765,25 +3290,73 @@ def _html_document(*, title: str, header_html: str, body_html: str) -> str:
         '<main class="container">\n'
         f"{body_html}\n"
         "</main>\n"
+        f'<script type="application/json" id="trustline-export">{export_json}</script>\n'
         "<script>"
         "(function(){"
         'var table=document.getElementById("inventory-table");'
         'var bar=document.getElementById("class-filter");'
+        "function download(name,text,mime){"
+        "var blob=new Blob([text],{type:mime});"
+        "var a=document.createElement('a');"
+        "a.href=URL.createObjectURL(blob);a.download=name;a.click();"
+        "setTimeout(function(){URL.revokeObjectURL(a.href);},1000);}"
+        "try{"
+        'var exp=JSON.parse(document.getElementById("trustline-export").textContent);'
+        'var csvBtn=document.getElementById("export-csv");'
+        'var mdBtn=document.getElementById("export-md");'
+        "if(csvBtn&&exp.csv){csvBtn.addEventListener('click',function(){"
+        "download('trustline-inventory.csv',exp.csv,'text/csv;charset=utf-8');});}"
+        "if(mdBtn&&exp.md){mdBtn.addEventListener('click',function(){"
+        "download('trustline-inventory.md',exp.md,'text/markdown;charset=utf-8');});}"
+        "}catch(e){}"
         "if(!table)return;"
-        "function applyFilter(filter){"
-        "if(bar){bar.querySelectorAll('button').forEach(function(b){"
-        "b.classList.toggle('active',b.getAttribute('data-filter')===filter);});}"
-        "table.querySelectorAll('tbody tr').forEach(function(row){"
-        "row.style.display=(filter==='all'||row.getAttribute('data-class')===filter)?'':'none';"
+        "var currentFilter='all';"
+        "var query='';"
+        "function applyView(){"
+        "if(bar){bar.querySelectorAll('button[data-filter]').forEach(function(b){"
+        "b.classList.toggle('active',b.getAttribute('data-filter')===currentFilter);});}"
+        "table.querySelectorAll('tbody tr.party-row').forEach(function(row){"
+        "var show=(currentFilter==='all'||row.getAttribute('data-class')===currentFilter);"
+        "if(show&&query){"
+        "var hay=row.getAttribute('data-search')||'';"
+        "show=hay.indexOf(query)>=0;}"
+        "row.style.display=show?'':'none';"
+        "var detail=row.nextElementSibling;"
+        "if(detail&&detail.classList.contains('party-detail')){"
+        "if(!show){detail.hidden=true;detail.style.display='none';"
+        "var btn=row.querySelector('.expand');"
+        "if(btn)btn.setAttribute('aria-expanded','false');}"
+        "}"
         "});}"
+        "function applyFilter(filter){currentFilter=filter||'all';applyView();}"
         "if(bar){bar.addEventListener('click',function(e){"
-        "var btn=e.target.closest('button');if(!btn)return;"
+        "var btn=e.target.closest('button[data-filter]');if(!btn)return;"
         "applyFilter(btn.getAttribute('data-filter')||'all');});}"
+        'var search=document.getElementById("party-search");'
+        "if(search){search.addEventListener('input',function(){"
+        "query=(search.value||'').toLowerCase().trim();applyView();});}"
         "document.querySelectorAll('.kpi[data-filter]').forEach(function(kpi){"
         "kpi.addEventListener('click',function(){applyFilter(kpi.getAttribute('data-filter')||'all');});"
         "kpi.addEventListener('keydown',function(e){"
         "if(e.key==='Enter'||e.key===' '){e.preventDefault();applyFilter(kpi.getAttribute('data-filter')||'all');}"
         "});});"
+        "table.addEventListener('click',function(e){"
+        "var btn=e.target.closest('button.expand');if(!btn)return;"
+        "var row=btn.closest('tr');"
+        "var detail=row&&row.nextElementSibling;"
+        "if(!detail||!detail.classList.contains('party-detail'))return;"
+        "var wasHidden=detail.hidden;"
+        "detail.hidden=!wasHidden;"
+        "detail.style.display=wasHidden?'':'none';"
+        "btn.setAttribute('aria-expanded',wasHidden?'true':'false');"
+        "});"
+        "if(location.hash){"
+        "var target=document.getElementById(location.hash.slice(1));"
+        "if(target&&target.classList.contains('party-row')){"
+        "var openBtn=target.querySelector('.expand');"
+        "if(openBtn)openBtn.click();"
+        "target.scrollIntoView({block:'start'});"
+        "}}"
         "})();"
         "</script>\n"
         '<footer class="footer container">'
@@ -2966,26 +3539,17 @@ def generate_html_report(
             neutral=neutral,
         )
 
-    party_rows = "".join(
-        f'<tr data-class="{_h(party["classification"])}">'
-        f"<td>{_h(party['name'])}</td>"
-        f"<td class=\"muted\">{_h(party['name_source_label'])}</td>"
-        f"<td>{_html_pill(party['classification'], _party_pill_kind(party['classification']))}</td>"
-        f"<td>{party['grant_count']}</td>"
-        f"<td class=\"muted\">{_h(', '.join(party['mechanisms']))}</td>"
-        f"<td class=\"muted\">{_h(_party_resource_summary(party))}</td>"
-        "</tr>"
-        for party in parties
-    )
+    party_rows = _party_inventory_rows(parties)
     if parties:
         inventory_html = _render_section(
             "External access by principal",
             party_rows,
-            ["Principal", "Name source", "Classification", "Grants", "Mechanisms", "Resources"],
+            _PARTY_INVENTORY_COLUMNS,
             subtitle=(
                 f"{len(parties)} external part"
                 f"{'y' if len(parties) == 1 else 'ies'}. "
-                "Filter by classification, or click a party KPI."
+                "Open Details for why, resources, and how to fix. "
+                "Filter by class, search, or click a party KPI. Export CSV or Markdown."
             ),
             empty_message="No current external access in scanned surfaces.",
             neutral=True,
@@ -3039,12 +3603,16 @@ def generate_html_report(
     parts.append(_render_coverage_html(coverage))
 
     body_html = hero_html + kpis_html + "\n".join(part for part in parts if part)
+    inventory_md, _blocked = _inventory_markdown(grants)
+    export_md = inventory_md + party_details_markdown(parties)
     with open(report_file, "w") as fh:
         fh.write(
             _html_document(
                 title=f"Trustline Report - {identity_label}",
                 header_html=header_html,
                 body_html=body_html,
+                export_csv=inventory_csv(grants),
+                export_md=export_md,
             )
         )
     return report_file
@@ -3109,9 +3677,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--skip-resource-policies",
         action="store_true",
         help=(
-            "Skip KMS, SNS, SQS, Lambda, Lambda layer, Secrets Manager, and ECR "
-            "resource policies (policy scanner only; Access Analyzer already covers "
-            "these types). Also skips KMS ListGrants on the policy scanner."
+            "Skip KMS, SNS, SQS, Lambda, Lambda layer, Secrets Manager, ECR, "
+            "EFS, and DynamoDB resource policies, plus EBS/RDS snapshot shares "
+            "(policy scanner only; Access Analyzer already covers these types). "
+            "Also skips KMS ListGrants on the policy scanner."
         ),
     )
     parser.add_argument("--skip-ram", action="store_true", help="Skip RAM resource shares")
@@ -3129,8 +3698,8 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Require IAM Access Analyzer (fail if none exists). Default is to "
             "use analyzers when found and walk IAM/S3 policies otherwise. "
-            "RAM, AMI, SSM, credentials, EventBridge, Glue, and OpenSearch "
-            "still run unless skipped."
+            "RAM, AMI, SSM, credentials, EventBridge, Glue, OpenSearch, and "
+            "PrivateLink still run unless skipped."
         ),
     )
     backend_group.add_argument(
@@ -3170,7 +3739,7 @@ def build_parser() -> argparse.ArgumentParser:
     region_group = parser.add_mutually_exclusive_group()
     region_group.add_argument(
         "--regions",
-        help="Comma-separated regions for RAM, AMI, SSM, AA, and resource-policy collectors",
+        help="Comma-separated regions for RAM, AMI, SSM, AA, resource policies, EventBridge, Glue, OpenSearch, PrivateLink, and snapshots",
     )
     region_group.add_argument(
         "--all-regions",
@@ -3179,12 +3748,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--format",
-        choices=["html", "md", "json", "both"],
+        choices=["html", "md", "json", "csv", "both"],
         default=None,
         help=(
             "Report format(s). json is the machine-readable inventory (parties + grants). "
-            "both writes html and markdown. Default: html when Access Analyzer is used, "
-            "md for the policy scanner."
+            "csv is one row per grant with why/how-to-fix. both writes html and markdown. "
+            "HTML also embeds CSV and Markdown export buttons. Default: html when Access "
+            "Analyzer is used, md for the policy scanner."
         ),
     )
     parser.add_argument("--verbose", action="store_true", help="Show full error tracebacks")
@@ -3245,6 +3815,8 @@ def generate_json_report(
                 "grant_count": party["grant_count"],
                 "mechanisms": party["mechanisms"],
                 "resources": list(dict.fromkeys(party.get("resources") or [])),
+                "why": classification_reason(party),
+                "how_to_fix": party_fixes(party),
             }
             for party in parties
         ],
@@ -3265,6 +3837,24 @@ def generate_json_report(
     with open(report_file, "w", encoding="utf-8") as fh:
         json.dump(payload, fh, indent=2, default=str)
         fh.write("\n")
+    return report_file
+
+
+def generate_csv_report(
+    grants: list[dict[str, Any]],
+    *,
+    account_aliases: dict[str, str],
+    scope: str = "account",
+    output_dir: str = ".",
+) -> str:
+    """Write one CSV row per grant, with classification reason and fix."""
+    current_account_id = (
+        list(account_aliases.keys())[0] if account_aliases else "unknown"
+    )
+    slug = "org" if scope == "organization" else current_account_id
+    report_file = _report_filename(output_dir, slug, "csv")
+    with open(report_file, "w", encoding="utf-8", newline="") as fh:
+        fh.write(inventory_csv(grants))
     return report_file
 
 
@@ -3312,6 +3902,14 @@ def _write_reports(
             badge=badge,
         )
         console.print(f"[bold green]JSON report: {json_path}[/bold green]")
+    if output_format == "csv":
+        csv_path = generate_csv_report(
+            grants,
+            account_aliases=account_aliases,
+            scope=scope,
+            output_dir=args.output,
+        )
+        console.print(f"[bold green]CSV report: {csv_path}[/bold green]")
 
 
 def _run_access_analyzer_backend(
@@ -3474,7 +4072,8 @@ def _run_policy_scanner(
         skipped.append(
             {
                 "surface": (
-                    "KMS / SNS / SQS / Lambda / Lambda layer / Secrets / ECR policies"
+                    "KMS / SNS / SQS / Lambda / Lambda layer / Secrets / ECR / "
+                    "EFS / DynamoDB policies and EBS/RDS snapshot shares"
                 ),
                 "detail": "--skip-resource-policies",
             }

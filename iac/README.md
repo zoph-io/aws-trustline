@@ -1,7 +1,7 @@
 # AWS Trustline scheduled scanner (Lambda + EventBridge + S3)
 
 Deploy [AWS Trustline](../README.md) as a scheduled AWS Lambda. Grant rows from
-IAM Access Analyzer (plus RAM / AMI / SSM / credentials / EventBridge / Glue / OpenSearch) are classified against
+IAM Access Analyzer (plus RAM / AMI / SSM / credentials / EventBridge / Glue / OpenSearch / PrivateLink) are classified against
 the [fwd:cloudsec](https://github.com/fwdcloudsec/known_aws_accounts) vendor
 dataset. The HTML report leads with an inventory grouped by principal (names
 from fwd:cloudsec / Organizations), ends with a collapsed coverage appendix,
@@ -204,7 +204,11 @@ The Lambda execution role is built inline in
 | `iam:ListServiceSpecificCredentials` | `*` | Long-lived API keys / service-specific credentials |
 | `ec2:DescribeRegions` | `*` | Enumerate enabled regions when `Regions=all` |
 | `ec2:DescribeImages` / `DescribeImageAttribute` | `*` | AMI launch permissions |
+| `ec2:DescribeVpcEndpointServiceConfigurations` / `DescribeVpcEndpointServicePermissions` | `*` | PrivateLink allowed principals |
 | `ram:GetResourceShareAssociations` / `ListResourceSharePermissions` / `GetPermission` | `*` | RAM resource shares |
+| `events:ListEventBuses` / `DescribeEventBus` | `*` | EventBridge bus policies |
+| `glue:GetResourcePolicy` | `*` | Glue Data Catalog resource policy |
+| `es:ListDomainNames` / `DescribeDomain` | `*` | OpenSearch domain access policies |
 | `ssm:ListDocuments` / `DescribeDocumentPermission` | `*` | SSM document shares |
 | `organizations:ListAccounts` / `DescribeOrganization` | `*` | Label org members; recognize this-org ARNs |
 | `s3:PutObject*` | `${ReportBucket}/*` | Upload generated HTML |
@@ -225,7 +229,7 @@ multipart uploads after 7 days.
 - **Time the scan with a real timezone.** Set `ScheduleTimezone=Europe/Paris`
   and `ScheduleExpression=cron(0 7 * * ? *)` to scan at 07:00 local time
   every day across summer/winter time changes.
-- **Read a report locally.** The HTML is self-contained (inline CSS, no JS).
+- **Read a report locally.** The HTML is self-contained (inline CSS and a small script for filters, Details panes, and CSV/Markdown export).
   Leftover tables come first; coverage is a collapsed appendix at the bottom.
 
   ```bash

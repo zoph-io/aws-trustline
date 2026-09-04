@@ -7,21 +7,30 @@ from __future__ import annotations
 import unittest
 
 from grants import (
+    MECHANISM_LABELS,
+    OUT_OF_SCOPE_SURFACES,
     actions_from_ram_permission,
     apply_live_trust_conditions,
     apply_s3_effective_public,
+    aws_console_url,
+    build_coverage,
     choose_external_analyzer,
+    classification_reason,
     classify_parsed_principal,
     extract_account_id_from_iam_value,
     flatten_condition_keys,
+    grant_fix,
     grant_resource_label,
     grants_from_policy_document,
     index_known_accounts,
+    inventory_csv,
+    leftover_flags,
     loads_policy_document,
     merge_builtin_vendors,
     oidc_condition_gaps,
     parse_principal_value,
     parties_from_grants,
+    party_fixes,
     party_totals,
     report_scope_label,
     totals_from_grants,
@@ -1056,8 +1065,165 @@ class JsonReportTests(unittest.TestCase):
         self.assertEqual(payload["tool"], "aws-trustline")
         self.assertEqual(payload["totals"]["parties"]["unknown"], 1)
         self.assertEqual(payload["parties"][0]["classification"], "unknown")
+        self.assertIn("why", payload["parties"][0])
+        self.assertTrue(payload["parties"][0]["how_to_fix"])
         self.assertEqual(payload["grants"][0]["mechanism"], "glue_catalog_policy")
         self.assertIn("444455556666", payload["parties"][0]["name"])
+
+
+class FindingDetailAndExportTests(unittest.TestCase):
+    def _public_s3_grants(self):
+        return grants_from_policy_document(
+            {
+                "Statement": {
+                    "Effect": "Allow",
+                    "Principal": "*",
+                    "Action": "s3:GetObject",
+                }
+            },
+            resource="arn:aws:s3:::example-bucket",
+            resource_type="AWS::S3::Bucket",
+            mechanism="s3_bucket_policy",
+            trusted_accounts={},
+            account_to_vendor={},
+            current_account_id="111122223333",
+        )
+
+    def test_classification_reason_and_fix(self):
+        grants = self._public_s3_grants()
+        parties = parties_from_grants(grants)
+        self.assertEqual(parties[0]["classification"], "public")
+        reason = classification_reason(parties[0])
+        self.assertIn("everyone", reason.lower())
+        self.assertIn("Bucket policy", grant_fix(grants[0]))
+        self.assertTrue(party_fixes(parties[0]))
+        self.assertIn("public", leftover_flags(grants[0]))
+
+    def test_inventory_csv_has_why_and_console(self):
+        text = inventory_csv(self._public_s3_grants())
+        header = text.splitlines()[0]
+        self.assertIn("why", header)
+        self.assertIn("how_to_fix", header)
+        self.assertIn("console_url", header)
+        self.assertIn("public", text)
+        self.assertIn("s3.console.aws.amazon.com", text)
+
+    def test_html_has_inline_details_search_and_export(self):
+        import tempfile
+
+        from trustline import generate_html_report
+
+        coverage = {"scanned": [], "not_scanned": [], "backend": "policy_scanner"}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = generate_html_report(
+                self._public_s3_grants(),
+                coverage,
+                account_aliases={"111122223333": "example"},
+                output_dir=tmp,
+            )
+            with open(path, encoding="utf-8") as fh:
+                html = fh.read()
+        self.assertIn('class="party-row"', html)
+        self.assertIn('class="party-detail"', html)
+        self.assertIn("Why this classification", html)
+        self.assertIn("How to fix", html)
+        self.assertIn('id="export-csv"', html)
+        self.assertIn('id="export-md"', html)
+        self.assertIn('id="party-search"', html)
+        self.assertIn("trustline-export", html)
+        self.assertIn("Everyone", html)
+
+    def test_markdown_and_csv_reports(self):
+        import tempfile
+
+        from trustline import generate_csv_report, generate_markdown_report
+
+        grants = self._public_s3_grants()
+        coverage = {"scanned": [], "not_scanned": [], "backend": "policy_scanner"}
+        with tempfile.TemporaryDirectory() as tmp:
+            md_path = generate_markdown_report(
+                grants,
+                coverage,
+                account_aliases={"111122223333": "example"},
+                output_dir=tmp,
+            )
+            csv_path = generate_csv_report(
+                grants,
+                account_aliases={"111122223333": "example"},
+                output_dir=tmp,
+            )
+            with open(md_path, encoding="utf-8") as fh:
+                md = fh.read()
+            with open(csv_path, encoding="utf-8") as fh:
+                csv_text = fh.read()
+        self.assertIn("## Party details", md)
+        self.assertIn("Why this classification", md)
+        self.assertIn("how_to_fix", csv_text.splitlines()[0])
+
+    def test_rds_restore_all_is_public(self):
+        from trustline import _rds_restore_attribute_grants
+
+        kwargs = {
+            "trusted_accounts": {},
+            "account_to_vendor": {},
+            "current_account_id": "111122223333",
+            "owner_account": "111122223333",
+            "owner_label": "example",
+            "our_organization_id": None,
+        }
+        grants = _rds_restore_attribute_grants(
+            attributes=[{"AttributeName": "restore", "AttributeValues": ["all"]}],
+            resource="arn:aws:rds:eu-west-1:111122223333:snapshot:manual-1",
+            resource_type="AWS::RDS::DBSnapshot",
+            mechanism="rds_snapshot_share",
+            region="eu-west-1",
+            kwargs=kwargs,
+            actions=["rds:RestoreDBInstanceFromDBSnapshot"],
+        )
+        self.assertEqual(len(grants), 1)
+        self.assertEqual(grants[0]["classification"], "public")
+        self.assertIn("Share snapshot", grant_fix(grants[0]))
+
+    def test_unknown_ebs_share_and_console_link(self):
+        from trustline import _grant_from_principal_string
+
+        kwargs = {
+            "trusted_accounts": {},
+            "account_to_vendor": {},
+            "current_account_id": "111122223333",
+            "owner_account": "111122223333",
+            "owner_label": "example",
+            "our_organization_id": None,
+        }
+        grant = _grant_from_principal_string(
+            "444455556666",
+            resource="arn:aws:ec2:eu-west-1:111122223333:snapshot/snap-abc",
+            resource_type="AWS::EC2::Snapshot",
+            mechanism="ebs_snapshot_share",
+            region="eu-west-1",
+            kwargs=kwargs,
+            actions=["ec2:CreateVolume"],
+        )
+        self.assertIsNotNone(grant)
+        self.assertEqual(grant["classification"], "unknown")
+        self.assertIn("createVolumePermission", grant_fix(grant))
+        url = aws_console_url(grant)
+        self.assertIsNotNone(url)
+        self.assertIn("snap-abc", url)
+
+    def test_privatelink_is_in_scope_and_labeled(self):
+        self.assertNotIn(
+            "PrivateLink allowed principals",
+            {surface for surface, _ in OUT_OF_SCOPE_SURFACES},
+        )
+        self.assertIn("privatelink_allowed_principal", MECHANISM_LABELS)
+        coverage = build_coverage(
+            backend="policy_scanner",
+            scanned=[{"surface": "EFS file system policies", "detail": "eu-west-1"}],
+        )
+        surfaces = {item["surface"] for item in coverage["not_scanned"]}
+        self.assertIn("S3 ACLs and S3 Directory Buckets", surfaces)
+        self.assertNotIn("S3 ACLs, EFS file systems, RDS snapshots", surfaces)
 
 
 if __name__ == "__main__":

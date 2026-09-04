@@ -6,7 +6,7 @@ Trustline collects **grant rows** (one resource × one principal × one mechanis
 
 ## How to read a report
 
-The first table is the **inventory**: one row per external party, with the resolved name and which directory produced it. The Resources column includes the AWS type when the last ARN segment is a UUID, a short digit, or not an IAM role / S3 bucket name. The HTML report filters that table by classification (chips under the heading, or click a party KPI).
+The first table is the **inventory**: one row per external party, with the resolved name and which directory produced it. The Resources column includes the AWS type when the last ARN segment is a UUID, a short digit, or not an IAM role / S3 bucket name. On HTML, click **Details** on a party for the resources involved, why it is classified that way, and how to fix it (one file — the pane expands in place). Filter by classification chips, click a party KPI, or use the search box. **Export CSV** and **Export Markdown** download the inventory from that same page.
 
 | Classification | Meaning |
 |---|---|
@@ -97,7 +97,7 @@ flowchart LR
     C[trusted_accounts.yaml] --> D
     D --> P["Policy scanner if no AA<br/>IAM / S3 / KMS+grants / SNS / SQS / Lambda / layers / Secrets / ECR"]
     D --> AA["Access Analyzer<br/>when present"]
-    D --> X["RAM / AMI / SSM / API keys / EventBridge / Glue / OpenSearch"]
+    D --> X["RAM / AMI / SSM / API keys / EventBridge / Glue / OpenSearch / PrivateLink"]
     P --> G["Grant rows"]
     AA --> G
     X --> G
@@ -105,15 +105,15 @@ flowchart LR
 ```
 
 1. Load vendor IDs (fwd:cloudsec, cached under `~/.cache/aws-trustline/`), Organization members and org ID (if allowed), and YAML trusted accounts.
-2. If an **ACCOUNT** Access Analyzer exists in the requested regions, use it for IAM/S3-class resources. If only an ORGANIZATION analyzer exists, use it but **keep findings owned by this account** (pass `--scope organization` for the whole org). Otherwise walk IAM trusts, S3 bucket policies, KMS key policies **and** `ListGrants`, and SNS / SQS / Lambda / Lambda layer / Secrets Manager / ECR resource policies. RAM, AMI, SSM, and credentials always run unless skipped. EventBridge bus policies, Glue Data Catalog resource policies, and OpenSearch domain access policies always run (Access Analyzer does not cover them).
+2. If an **ACCOUNT** Access Analyzer exists in the requested regions, use it for IAM/S3-class resources. If only an ORGANIZATION analyzer exists, use it but **keep findings owned by this account** (pass `--scope organization` for the whole org). Otherwise walk IAM trusts, S3 bucket policies, KMS key policies **and** `ListGrants`, and SNS / SQS / Lambda / Lambda layer / Secrets Manager / ECR / EFS / DynamoDB resource policies, plus EBS and RDS snapshot shares. RAM, AMI, SSM, and credentials always run unless skipped. EventBridge bus policies, Glue Data Catalog resource policies, OpenSearch domain access policies, and PrivateLink allowed principals always run (Access Analyzer does not cover them).
 3. Classify each grant and **group by principal**. Resolve 12-digit IDs. CloudFront OAI/OAC is trusted AWS (one party). Flag missing ExternalId, GitHub/GitLab `sub`/`aud`, and never-expiring credentials. Policy-scanner public S3 is checked with `GetBucketPolicyStatus`. Access Analyzer leftover flags for IAM roles are taken from the live trust policy (`iam:GetRole`), not from findings that omit Condition.
 4. Print the inventory, then leftover flags. Coverage is an appendix.
 
-Mechanisms: trust policy, S3 bucket policy, KMS key policy, KMS cryptographic grant, SNS/SQS/Lambda/Lambda layer/Secrets Manager/ECR/EventBridge/Glue/OpenSearch resource policy, RAM share, AMI launch permission, SSM document share, service-specific credential, or Access Analyzer finding.
+Mechanisms: trust policy, S3 bucket policy, KMS key policy, KMS cryptographic grant, SNS/SQS/Lambda/Lambda layer/Secrets Manager/ECR/EFS/DynamoDB/EventBridge/Glue/OpenSearch resource policy, PrivateLink allowed principal, EBS/RDS snapshot share, RAM share, AMI launch permission, SSM document share, service-specific credential, or Access Analyzer finding.
 
 ## Usage
 
-Default: **use Access Analyzer when one exists** (effective access for AA resource types). `--scope auto` (default) **prefers ACCOUNT analyzers** so the inventory is this account. ORGANIZATION analyzers are used only when no ACCOUNT analyzer exists in that region, and those findings are still limited to this account unless you pass `--scope organization`. If none exists, walk IAM trusts, S3 bucket policies, KMS key policies and cryptographic grants, and SNS / SQS / Lambda / Lambda layer / Secrets Manager / ECR resource policies. RAM, AMI, SSM, and service-specific credentials run in both cases unless skipped. EventBridge, Glue Data Catalog, and OpenSearch domain policies always run.
+Default: **use Access Analyzer when one exists** (effective access for AA resource types). `--scope auto` (default) **prefers ACCOUNT analyzers** so the inventory is this account. ORGANIZATION analyzers are used only when no ACCOUNT analyzer exists in that region, and those findings are still limited to this account unless you pass `--scope organization`. If none exists, walk IAM trusts, S3 bucket policies, KMS key policies and cryptographic grants, SNS / SQS / Lambda / Lambda layer / Secrets Manager / ECR / EFS / DynamoDB resource policies, and EBS/RDS snapshot shares. RAM, AMI, SSM, and service-specific credentials run in both cases unless skipped. EventBridge, Glue Data Catalog, OpenSearch domain policies, and PrivateLink allowed principals always run.
 
 ```bash
 python trustline.py
@@ -129,6 +129,9 @@ python trustline.py --use-access-analyzer --wait-for-analyzer
 
 # Machine-readable inventory (parties + grants) for pipelines
 python trustline.py --format json
+
+# One CSV row per grant (why / how to fix / console URL)
+python trustline.py --format csv
 
 # Skip slower collectors
 python trustline.py --skip-ram --skip-ami --skip-ssm --skip-credentials
@@ -163,7 +166,7 @@ With `--scope organization`, findings are grouped by `resourceOwnerAccount` usin
 | `--trusted-accounts` | `-t` | YAML path (default: `trusted_accounts.yaml`) |
 | `--skip-iam` | | Skip IAM role trusts (policy scanner only) |
 | `--skip-s3` | | Skip S3 bucket policies (policy scanner only) |
-| `--skip-resource-policies` | | Skip KMS (policy + ListGrants)/SNS/SQS/Lambda/layer/Secrets/ECR (policy scanner only) |
+| `--skip-resource-policies` | | Skip KMS (policy + ListGrants)/SNS/SQS/Lambda/layer/Secrets/ECR/EFS/DynamoDB and EBS/RDS snapshot shares (policy scanner only) |
 | `--skip-ram` | | Skip RAM resource shares |
 | `--skip-ami` | | Skip AMI launch permissions |
 | `--skip-ssm` | | Skip SSM document shares |
@@ -173,9 +176,9 @@ With `--scope organization`, findings are grouped by `resourceOwnerAccount` usin
 | `--wait-for-analyzer` | | Poll until ACTIVE finding counts stabilize when analyzers are used |
 | `--wait-timeout` | | Seconds to wait (default: 300) |
 | `--scope` | | `auto` (default: prefer ACCOUNT analyzers; this-account inventory), `account`, or `organization` |
-| `--regions` | | Comma-separated regions for RAM / AMI / SSM / AA / resource policies / EventBridge / Glue / OpenSearch |
+| `--regions` | | Comma-separated regions for RAM / AMI / SSM / AA / resource policies / EventBridge / Glue / OpenSearch / PrivateLink / snapshots |
 | `--all-regions` | | Every enabled region (`ec2:DescribeRegions`) |
-| `--format` | | `html` (AA default), `md` (policy-scanner default), `json` (parties + grants), or `both` (html+md) |
+| `--format` | | `html` (AA default), `md` (policy-scanner default), `json` (parties + grants), `csv` (one row per grant), or `both` (html+md). HTML includes Details panes plus CSV/Markdown export buttons |
 | `--verbose` | | Full error tracebacks |
 | `--version` | `-V` | Print version and exit |
 
@@ -221,25 +224,24 @@ Not scanned (always listed):
 - Kafka ACLs on MSK
 - OpenSearch fine-grained access control
 - OpenSearch Serverless data access policies
-- PrivateLink allowed principals
 - Route 53 VPC association authorizations
 - Copies, replication, and DLM share rules
 - SES sending authorization
 
-The **policy scanner** does not evaluate Deny. `Principal: "*"` with `aws:SourceAccount` / `aws:SourceArn` is not treated as public (SNS/Lambda notification pattern); a SourceAccount is named as that party instead. `Principal: "*"` with `aws:PrincipalOrgID` is named as that organization (trusted if it is yours). It walks KMS key policies and cryptographic grants (`ListGrants`), SNS, SQS, Lambda function, Lambda layer (up to 25 newest versions per layer), Secrets Manager, and ECR repository resource policies (Allow-principal matching). EventBridge bus policies, Glue Data Catalog resource policies, and OpenSearch **domain** access policies run on **both** backends (Access Analyzer does not cover them; OpenSearch fine-grained access control and Serverless data-access policies stay out of scope). It still does not cover S3 ACLs, EFS, or RDS snapshots. Public S3 `Allow *` is checked with `GetBucketPolicyStatus`.
+The **policy scanner** does not evaluate Deny. `Principal: "*"` with `aws:SourceAccount` / `aws:SourceArn` is not treated as public (SNS/Lambda notification pattern); a SourceAccount is named as that party instead. `Principal: "*"` with `aws:PrincipalOrgID` is named as that organization (trusted if it is yours). It walks KMS key policies and cryptographic grants (`ListGrants`), SNS, SQS, Lambda function, Lambda layer (up to 25 newest versions per layer), Secrets Manager, ECR repository, EFS file system, and DynamoDB table/stream resource policies (Allow-principal matching). It also walks EBS snapshot create-volume permissions and RDS/Aurora **manual** snapshot restore attributes. EventBridge bus policies, Glue Data Catalog resource policies, OpenSearch **domain** access policies, and PrivateLink allowed principals run on **both** backends (Access Analyzer does not cover them; OpenSearch fine-grained access control and Serverless data-access policies stay out of scope). S3 ACLs and S3 Directory Buckets still need Access Analyzer. Public S3 `Allow *` is checked with `GetBucketPolicyStatus`.
 
-**Access Analyzer** only reasons about [its documented resource types](https://docs.aws.amazon.com/IAM/latest/UserGuide/access-analyzer-resources.html) (S3, IAM roles, KMS, Lambda, SQS, …). RAM shares, AMI launch permissions, and SSM document shares are outside that ceiling; Trustline scans those separately. Lambda aliases/versions and service principals stay not-scanned. Organization-scope analyzers treat sibling accounts as in-zone-of-trust, so they will not appear as AA findings. Duplicate findings for the same IAM role from two analyzers are collapsed. The appendix prints the exact type list the tool uses.
+**Access Analyzer** only reasons about [its documented resource types](https://docs.aws.amazon.com/IAM/latest/UserGuide/access-analyzer-resources.html) (S3, IAM roles, KMS, Lambda, SQS, EFS, DynamoDB, EBS/RDS snapshots, …). RAM shares, AMI launch permissions, SSM document shares, EventBridge/Glue/OpenSearch policies, and PrivateLink allowed principals are outside that ceiling; Trustline scans those separately. Lambda aliases/versions and service principals stay not-scanned. Organization-scope analyzers treat sibling accounts as in-zone-of-trust, so they will not appear as AA findings. Duplicate findings for the same IAM role from two analyzers are collapsed. The appendix prints the exact type list the tool uses.
 
 ## Choosing a backend
 
-Default is **hybrid**: Access Analyzer when one exists, otherwise the policy scanner. RAM / AMI / SSM / credentials always run unless skipped. EventBridge, Glue catalog, and OpenSearch domain policies always run.
+Default is **hybrid**: Access Analyzer when one exists, otherwise the policy scanner. RAM / AMI / SSM / credentials always run unless skipped. EventBridge, Glue catalog, OpenSearch domain policies, and PrivateLink always run.
 
 | Aspect | Policy scanner (`--policy-scanner` or no analyzer) | Access Analyzer (default when found) |
 |---|---|---|
 | Setup | Runs immediately | Needs an existing external analyzer (free) |
-| IAM / S3-class coverage | IAM trusts, S3 buckets, KMS keys (policy + ListGrants), SNS, SQS, Lambda, layers, Secrets Manager, ECR | [AA-supported types](https://docs.aws.amazon.com/IAM/latest/UserGuide/access-analyzer-resources.html) (includes KMS grants) |
+| IAM / S3-class coverage | IAM trusts, S3 buckets, KMS keys (policy + ListGrants), SNS, SQS, Lambda, layers, Secrets Manager, ECR, EFS, DynamoDB, EBS/RDS snapshot shares | [AA-supported types](https://docs.aws.amazon.com/IAM/latest/UserGuide/access-analyzer-resources.html) (includes KMS grants, EFS, DynamoDB, snapshots) |
 | RAM / AMI / SSM / API keys | Yes (unless `--skip-*`) | Yes (unless `--skip-*`) |
-| EventBridge / Glue / OpenSearch domain | Yes | Yes |
+| EventBridge / Glue / OpenSearch domain / PrivateLink | Yes | Yes |
 | Cross-account accuracy | Allow-principal matching; S3 public checked via GetBucketPolicyStatus | Provable reasoning (Deny, conditions, BPA, org zone-of-trust) |
 | Report | Inventory by principal; unresolved IDs labeled | Same inventory |
 | Freshness | Live API calls | Cached findings; `--wait-for-analyzer` polls until counts stabilize |
@@ -292,7 +294,20 @@ Default is **hybrid**: Access Analyzer when one exists, otherwise the policy sca
         "events:DescribeEventBus",
         "glue:GetResourcePolicy",
         "es:ListDomainNames",
-        "es:DescribeDomain"
+        "es:DescribeDomain",
+        "elasticfilesystem:DescribeFileSystems",
+        "elasticfilesystem:DescribeFileSystemPolicy",
+        "dynamodb:ListTables",
+        "dynamodb:GetResourcePolicy",
+        "dynamodbstreams:ListStreams",
+        "ec2:DescribeSnapshots",
+        "ec2:DescribeSnapshotAttribute",
+        "ec2:DescribeVpcEndpointServiceConfigurations",
+        "ec2:DescribeVpcEndpointServicePermissions",
+        "rds:DescribeDBSnapshots",
+        "rds:DescribeDBSnapshotAttributes",
+        "rds:DescribeDBClusterSnapshots",
+        "rds:DescribeDBClusterSnapshotAttributes"
       ],
       "Resource": "*"
     },
@@ -357,7 +372,7 @@ Add:
 
 `ec2:DescribeRegions` is needed for `--all-regions`. For `--scope organization`, the caller must be in the Organizations management account or the IAM Access Analyzer delegated-admin account.
 
-EventBridge bus policies, Glue Data Catalog resource policies, and OpenSearch domain access policies are **not** Access Analyzer resource types. The Lambda/scheduled scanner still needs `events:ListEventBuses`, `events:DescribeEventBus`, `glue:GetResourcePolicy`, `es:ListDomainNames`, and `es:DescribeDomain` (included in the policy-scanner block above).
+EventBridge bus policies, Glue Data Catalog resource policies, OpenSearch domain access policies, and PrivateLink allowed principals are **not** Access Analyzer resource types. The Lambda/scheduled scanner still needs `events:ListEventBuses`, `events:DescribeEventBus`, `glue:GetResourcePolicy`, `es:ListDomainNames`, `es:DescribeDomain`, `ec2:DescribeVpcEndpointServiceConfigurations`, and `ec2:DescribeVpcEndpointServicePermissions` (included in the policy-scanner block above).
 
 ## Scheduled scanning on AWS
 

@@ -219,6 +219,12 @@ Resources:
                 - es:ListDomainNames
                 - es:DescribeDomain
               Resource: "*"
+            - Sid: PrivateLinkAllowedPrincipals
+              Effect: Allow
+              Action:
+                - ec2:DescribeVpcEndpointServiceConfigurations
+                - ec2:DescribeVpcEndpointServicePermissions
+              Resource: "*"
             - Sid: SsmDocumentShares
               Effect: Allow
               Action:

@@ -67,10 +67,6 @@ OUT_OF_SCOPE_SURFACES: tuple[tuple[str, str], ...] = (
         "Collection-level data access, not a domain resource policy",
     ),
     (
-        "PrivateLink allowed principals",
-        "VPC endpoint service configuration, not a resource policy",
-    ),
-    (
         "Route 53 VPC association authorizations",
         "Trusts a VPC ID, not an account; deleting the authorization leaves the association",
     ),
@@ -134,6 +130,12 @@ MECHANISM_LABELS: dict[str, str] = {
     "eventbridge_bus_policy": "EventBridge bus policy",
     "glue_catalog_policy": "Glue Data Catalog resource policy",
     "opensearch_domain_policy": "OpenSearch domain access policy",
+    "efs_file_system_policy": "EFS file system policy",
+    "dynamodb_resource_policy": "DynamoDB resource policy",
+    "privatelink_allowed_principal": "PrivateLink allowed principal",
+    "ebs_snapshot_share": "EBS snapshot create-volume permission",
+    "rds_snapshot_share": "RDS snapshot restore attribute",
+    "rds_cluster_snapshot_share": "RDS cluster snapshot restore attribute",
 }
 
 # Where a principal's display name came from. Reports print these labels.
@@ -967,6 +969,435 @@ def parties_from_grants(grants: Iterable[dict[str, Any]]) -> list[dict[str, Any]
     return parties
 
 
+def leftover_flags(grant: dict[str, Any]) -> list[str]:
+    flags: list[str] = []
+    if grant.get("is_public") or grant.get("classification") == "public":
+        flags.append("public")
+    if grant.get("missing_external_id"):
+        flags.append("missing ExternalId")
+    gaps = grant.get("oidc_gaps") or []
+    if grant.get("missing_oidc_subject"):
+        flags.append("OIDC missing " + (", ".join(str(g) for g in gaps) if gaps else "sub/aud"))
+    if grant.get("never_expires") and grant.get("credential_status", "Active") != "Inactive":
+        flags.append("never-expiring credential")
+    if grant.get("blocked_by_bpa"):
+        flags.append("blocked by Block Public Access")
+    return flags
+
+
+def classification_reason(party: dict[str, Any]) -> str:
+    """Why this party is classified as it is — for the finding detail pane."""
+    klass = party.get("classification") or "unknown"
+    source = party.get("name_source_label") or NAME_SOURCE_LABELS.get(
+        party.get("name_source") or "", party.get("name_source") or ""
+    )
+    account_id = party.get("account_id")
+    name = party.get("name") or ""
+    if klass == "public":
+        return (
+            "A scanned policy or share currently grants access to everyone "
+            "(Principal \"*\", AMI Group=all, or SSM AccountIds=all). "
+            "This is live public access on those resources, not a historical finding."
+        )
+    if klass == "unknown":
+        who = f"Account {account_id}" if account_id else name or "This principal"
+        return (
+            f"{who} was looked up in fwd:cloudsec known_aws_accounts, "
+            "trusted_accounts.yaml, and AWS Organizations, and was not in any of them. "
+            "Until you name it in YAML (or it is contributed to fwd:cloudsec), treat this "
+            "as unapproved third-party access."
+        )
+    if klass == "vendor":
+        return (
+            f"{name} is named in {source or 'fwd:cloudsec'}. Confirm the share is still "
+            "required, is least-privilege, and uses confused-deputy protections "
+            "(sts:ExternalId on IAM roles) where the vendor supports them."
+        )
+    if klass == "federated":
+        return (
+            f"{name} is an identity provider (OIDC, SAML, or Cognito), not a 12-digit "
+            "AWS account, so there is no vendor lookup. Restrict the trust with "
+            "audience/subject conditions (GitHub/GitLab: sub and aud)."
+        )
+    if klass == "trusted":
+        return (
+            f"{name} is named as trusted via {source or 'your org, YAML, or CloudFront'}. "
+            "It is still listed because it is external to this account — review that the "
+            "grants match what you intend to share with that party."
+        )
+    return f"Classified as {klass} (name source: {source or 'unresolved'})."
+
+
+_MECHANISM_FIX: dict[str, str] = {
+    "trust_policy": (
+        "Edit the role trust policy: remove this principal, or replace a wildcard "
+        "with a specific account or role ARN. Vendor roles should use sts:ExternalId. "
+        "GitHub Actions should require token.actions.githubusercontent.com:sub "
+        "(repo:ORG/REPO:...) and :aud (sts.amazonaws.com)."
+    ),
+    "s3_bucket_policy": (
+        "Edit the bucket policy: remove Allow for this principal (or Principal \"*\"). "
+        "Account- and bucket-level Block Public Access deny public ACLs/policies. "
+        "S3 console → bucket → Permissions → Bucket policy."
+    ),
+    "kms_key_policy": (
+        "Remove the statement from the KMS key policy, or replace Principal \"*\" with "
+        "the intended account/role. KMS console → Customer managed key → Key policy."
+    ),
+    "kms_grant": (
+        "Revoke the cryptographic grant (kms:RevokeGrant) if this principal should not "
+        "use the key. Grants are separate from the key policy; deleting a policy "
+        "statement does not retire them."
+    ),
+    "sns_topic_policy": (
+        "Remove the statement from the topic policy. If this is a service notification "
+        "pattern, keep aws:SourceAccount / aws:SourceArn and drop an unbound Principal \"*\"."
+    ),
+    "sqs_queue_policy": (
+        "Remove the statement from the queue policy, or bind Principal \"*\" with "
+        "aws:SourceAccount / aws:SourceArn for the intended producer."
+    ),
+    "lambda_resource_policy": (
+        "Remove the resource-based policy statement (lambda:RemovePermission). "
+        "For EventBridge/S3 invoke, prefer a SourceArn bound to that rule or bucket."
+    ),
+    "lambda_layer_policy": (
+        "Remove the layer-version permission (lambda:RemoveLayerVersionPermission). "
+        "Each published version has its own policy — revoke leftover versions too."
+    ),
+    "secretsmanager_resource_policy": (
+        "Remove the statement from the secret resource policy. Secrets Manager console "
+        "→ secret → Resource permissions."
+    ),
+    "ecr_repository_policy": (
+        "Remove the statement from the repository policy. ECR console → repository → "
+        "Permissions."
+    ),
+    "eventbridge_bus_policy": (
+        "Remove PutPermission / the bus policy statement. EventBridge console → "
+        "Event bus → Permissions. Org-wide Principal \"*\" + aws:PrincipalOrgID is "
+        "every account in that organization."
+    ),
+    "glue_catalog_policy": (
+        "Update or delete the Data Catalog resource policy (glue:PutResourcePolicy / "
+        "DeleteResourcePolicy). Glue console → Data Catalog settings → Permissions."
+    ),
+    "opensearch_domain_policy": (
+        "Tighten the domain access policy (not FGAC). OpenSearch console → domain → "
+        "Security configuration. Fine-grained access control is out of scope here."
+    ),
+    "efs_file_system_policy": (
+        "Remove or restrict the file system policy statement. EFS console → file system "
+        "→ File system policy. Client mount permissions (NFS / security groups) are separate."
+    ),
+    "dynamodb_resource_policy": (
+        "Remove the statement from the table or stream resource policy "
+        "(dynamodb:DeleteResourcePolicy). DynamoDB console → table → Permissions."
+    ),
+    "privatelink_allowed_principal": (
+        "Remove the principal from the endpoint service allowed-principals list. "
+        "VPC console → Endpoint services → Allow principals. Principal \"*\" lets any "
+        "AWS account discover (and, if acceptance is off, connect to) the service."
+    ),
+    "ebs_snapshot_share": (
+        "Remove the account (or Group=all) from createVolumePermission. "
+        "EC2 console → Snapshots → Actions → Modify permissions. Encrypted snapshots "
+        "also need a KMS key grant or policy for that account."
+    ),
+    "rds_snapshot_share": (
+        "Remove the account (or \"all\") from the snapshot restore attribute. "
+        "RDS console → Snapshots → Actions → Share snapshot. Only manual snapshots "
+        "can be shared."
+    ),
+    "rds_cluster_snapshot_share": (
+        "Remove the account (or \"all\") from the cluster snapshot restore attribute. "
+        "RDS console → Snapshots → Actions → Share snapshot."
+    ),
+    "ram_share": (
+        "Disassociate the principal from the resource share, or delete the share. "
+        "RAM console → Resource shares."
+    ),
+    "ami_launch_permission": (
+        "Remove the account (or Group=all) from the AMI launch permissions. "
+        "EC2 console → AMI → Actions → Edit AMI permissions."
+    ),
+    "ssm_document_share": (
+        "Remove the account (or \"all\") from the document share. Systems Manager → "
+        "Documents → Details → Permissions."
+    ),
+    "service_specific_credential": (
+        "Deactivate or delete the IAM service-specific credential, or set an expiration. "
+        "IAM console → Users → Security credentials."
+    ),
+    "access_analyzer": (
+        "Open the resource in the AWS console and remove or restrict the policy "
+        "statement Access Analyzer reported. Analyzer findings lag policy changes "
+        "(up to ~30 minutes; first scan can take ~20 minutes)."
+    ),
+}
+
+
+def grant_fix(grant: dict[str, Any]) -> str:
+    mechanism = grant.get("mechanism") or ""
+    text = _MECHANISM_FIX.get(mechanism) or (
+        f"Remove or restrict the {MECHANISM_LABELS.get(mechanism, mechanism) or 'grant'} "
+        "for this principal on the resource."
+    )
+    extras: list[str] = []
+    if grant.get("missing_external_id"):
+        extras.append("Add a unique sts:ExternalId condition on this trust statement.")
+    if grant.get("missing_oidc_subject"):
+        extras.append(
+            "Add OIDC conditions: "
+            + ", ".join(str(g) for g in (grant.get("oidc_gaps") or ["sub/aud"]))
+            + "."
+        )
+    if grant.get("never_expires"):
+        extras.append("Set an expiration or delete this service-specific credential.")
+    if extras:
+        return text + " " + " ".join(extras)
+    return text
+
+
+def party_fixes(party: dict[str, Any]) -> list[str]:
+    """Deduped remediation lines for every mechanism this party uses."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for grant in party.get("grants") or []:
+        line = grant_fix(grant)
+        if line not in seen:
+            seen.add(line)
+            out.append(line)
+    return out
+
+
+def aws_console_url(grant: dict[str, Any]) -> str | None:
+    """Deep link to the resource in the AWS console, when the type is known."""
+    from urllib.parse import quote
+
+    rtype = grant.get("resource_type") or ""
+    resource = grant.get("resource") or ""
+    region = grant.get("region") or ""
+    if not resource:
+        return None
+    name = short_resource_name(resource, rtype)
+    if rtype == "AWS::IAM::Role":
+        return (
+            "https://console.aws.amazon.com/iamv2/home#/roles/details/"
+            + quote(name, safe="")
+        )
+    if rtype == "AWS::IAM::User":
+        return (
+            "https://console.aws.amazon.com/iamv2/home#/users/details/"
+            + quote(name, safe="")
+        )
+    if rtype == "AWS::S3::Bucket":
+        bucket = resource.split(":::", 1)[-1] if ":::" in resource else name
+        suffix = f"?region={quote(region)}&tab=permissions" if region else "?tab=permissions"
+        return "https://s3.console.aws.amazon.com/s3/buckets/" + quote(bucket) + suffix
+    if rtype == "AWS::KMS::Key" and region:
+        key_id = resource.rsplit("/", 1)[-1] if "/" in resource else name
+        return (
+            f"https://{region}.console.aws.amazon.com/kms/home?region={region}"
+            f"#/kms/keys/{quote(key_id)}"
+        )
+    if rtype == "AWS::Lambda::Function" and region:
+        return (
+            f"https://{region}.console.aws.amazon.com/lambda/home?region={region}"
+            f"#/functions/{quote(name)}?tab=configure"
+        )
+    if rtype == "AWS::SNS::Topic" and region:
+        return (
+            f"https://{region}.console.aws.amazon.com/sns/v3/home?region={region}"
+            f"#/topic/{quote(resource)}"
+        )
+    if rtype == "AWS::SQS::Queue" and region:
+        return (
+            f"https://{region}.console.aws.amazon.com/sqs/v2/home?region={region}"
+            f"#/queues/{quote(resource)}"
+        )
+    if rtype == "AWS::SecretsManager::Secret" and region:
+        return (
+            f"https://{region}.console.aws.amazon.com/secretsmanager/secret?name="
+            f"{quote(name)}&region={region}"
+        )
+    if rtype == "AWS::ECR::Repository" and region:
+        return (
+            f"https://{region}.console.aws.amazon.com/ecr/repositories/private/"
+            f"{quote(name)}?region={region}"
+        )
+    if rtype == "AWS::Events::EventBus" and region:
+        bus = name if name else "default"
+        return (
+            f"https://{region}.console.aws.amazon.com/events/home?region={region}"
+            f"#/eventbus/{quote(bus)}"
+        )
+    if rtype == "AWS::Glue::DataCatalog" and region:
+        return (
+            f"https://{region}.console.aws.amazon.com/glue/home?region={region}"
+            "#/v2/data-catalog/settings"
+        )
+    if rtype == "AWS::OpenSearchService::Domain" and region:
+        return (
+            f"https://{region}.console.aws.amazon.com/aos/home?region={region}"
+            f"#opensearch/domains/{quote(name)}"
+        )
+    if rtype == "AWS::EC2::Image" and region:
+        return (
+            f"https://{region}.console.aws.amazon.com/ec2/home?region={region}"
+            f"#ImageDetails:imageId={quote(name)}"
+        )
+    if rtype == "AWS::SSM::Document" and region:
+        return (
+            f"https://{region}.console.aws.amazon.com/systems-manager/documents/"
+            f"{quote(name)}?region={region}"
+        )
+    if rtype == "AWS::Lambda::LayerVersion" and region:
+        layer = name.rsplit(":", 1)[0] if ":" in name else name
+        return (
+            f"https://{region}.console.aws.amazon.com/lambda/home?region={region}"
+            f"#/layers/{quote(layer)}"
+        )
+    if rtype == "AWS::EFS::FileSystem" and region:
+        fs_id = name
+        return (
+            f"https://{region}.console.aws.amazon.com/efs/home?region={region}"
+            f"#/file-systems/{quote(fs_id)}"
+        )
+    if rtype == "AWS::DynamoDB::Table" and region:
+        return (
+            f"https://{region}.console.aws.amazon.com/dynamodbv2/home?region={region}"
+            f"#table?name={quote(name)}"
+        )
+    if rtype == "AWS::DynamoDB::Stream" and region:
+        table = name.split("/stream/", 1)[0] if "/stream/" in (resource or "") else name
+        if "table/" in (resource or ""):
+            table = resource.split("table/", 1)[-1].split("/stream/", 1)[0]
+        return (
+            f"https://{region}.console.aws.amazon.com/dynamodbv2/home?region={region}"
+            f"#table?name={quote(table)}"
+        )
+    if rtype == "AWS::EC2::VPCEndpointService" and region:
+        return (
+            f"https://{region}.console.aws.amazon.com/vpcconsole/home?region={region}"
+            f"#EndpointServiceDetails:vpcEndpointServiceId={quote(name)}"
+        )
+    if rtype == "AWS::EC2::Snapshot" and region:
+        return (
+            f"https://{region}.console.aws.amazon.com/ec2/home?region={region}"
+            f"#SnapshotDetails:snapshotId={quote(name)}"
+        )
+    if rtype in ("AWS::RDS::DBSnapshot", "AWS::RDS::DBClusterSnapshot") and region:
+        return (
+            f"https://{region}.console.aws.amazon.com/rds/home?region={region}"
+            f"#snapshot:id={quote(name)}"
+        )
+    return None
+
+
+def condition_summary(grant: dict[str, Any]) -> str:
+    condition = grant.get("condition")
+    if not condition or not isinstance(condition, dict):
+        return ""
+    try:
+        return json.dumps(condition, sort_keys=True, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return str(condition)
+
+
+def inventory_csv(grants: Iterable[dict[str, Any]]) -> str:
+    """One CSV row per grant, with party classification reason and fix."""
+    import csv
+    from io import StringIO
+
+    grants_list = list(grants)
+    parties = parties_from_grants(grants_list)
+    by_key = {party["key"]: party for party in parties}
+    buf = StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(
+        [
+            "principal",
+            "account_id",
+            "classification",
+            "name_source",
+            "why",
+            "resource",
+            "resource_type",
+            "resource_label",
+            "region",
+            "mechanism",
+            "actions",
+            "condition",
+            "leftover_flags",
+            "how_to_fix",
+            "console_url",
+        ]
+    )
+    for grant in grants_list:
+        party = by_key.get(party_identity_key(grant))
+        writer.writerow(
+            [
+                (party or {}).get("name")
+                or grant.get("principal_label")
+                or grant.get("principal")
+                or "",
+                grant.get("principal_account_id") or "",
+                grant.get("classification") or "",
+                (party or {}).get("name_source_label") or grant.get("name_source") or "",
+                classification_reason(party) if party else "",
+                grant.get("resource") or "",
+                grant.get("resource_type") or "",
+                grant_resource_label(grant),
+                grant.get("region") or "",
+                MECHANISM_LABELS.get(grant.get("mechanism") or "", grant.get("mechanism") or ""),
+                " ".join(a for a in (grant.get("actions") or []) if isinstance(a, str)),
+                condition_summary(grant),
+                "; ".join(leftover_flags(grant)),
+                grant_fix(grant),
+                aws_console_url(grant) or "",
+            ]
+        )
+    return buf.getvalue()
+
+
+def party_details_markdown(parties: Iterable[dict[str, Any]]) -> str:
+    """Per-party why / resources / fix — for Markdown reports and HTML export."""
+    lines: list[str] = ["## Party details\n"]
+    parties_list = list(parties)
+    if not parties_list:
+        lines.append("No current external access in scanned surfaces.\n")
+        return "".join(lines)
+    for party in parties_list:
+        lines.append(f"### {party['name']}\n\n")
+        lines.append(f"- Classification: `{party['classification']}`\n")
+        lines.append(
+            f"- Name source: {party.get('name_source_label') or party.get('name_source')}\n"
+        )
+        lines.append(f"- Grants: {party['grant_count']}\n\n")
+        lines.append("**Why this classification**\n\n")
+        lines.append(classification_reason(party) + "\n\n")
+        lines.append("**How to fix**\n\n")
+        for fix in party_fixes(party):
+            lines.append(f"- {fix}\n")
+        lines.append("\n")
+        lines.append("| Resource | Type | Region | Mechanism | Actions | Flags | Console |\n")
+        lines.append("|----------|------|--------|-----------|---------|-------|---------|\n")
+        for grant in party.get("grants") or []:
+            url = aws_console_url(grant) or ""
+            link = f"[open]({url})" if url else ""
+            lines.append(
+                f"| `{grant.get('resource') or ''}` | "
+                f"{grant.get('resource_type') or ''} | "
+                f"{grant.get('region') or ''} | "
+                f"{MECHANISM_LABELS.get(grant.get('mechanism') or '', grant.get('mechanism') or '')} | "
+                f"{' '.join(a for a in (grant.get('actions') or []) if isinstance(a, str)) or '—'} | "
+                f"{', '.join(leftover_flags(grant)) or '—'} | {link} |\n"
+            )
+        lines.append("\n")
+    return "".join(lines)
+
+
 def index_known_accounts(vendors_data: Any) -> dict[str, dict[str, Any]]:
     """Index fwd:cloudsec-shaped YAML (list of {name, accounts, ...}) by account ID."""
     account_to_vendor: dict[str, dict[str, Any]] = {}
@@ -1253,10 +1684,11 @@ def build_coverage(
         not_scanned.insert(
             0,
             {
-                "surface": "S3 ACLs, EFS file systems, RDS snapshots",
+                "surface": "S3 ACLs and S3 Directory Buckets",
                 "detail": (
-                    "Key/topic/queue/function/layer/secret/ECR policies and KMS "
-                    "ListGrants are scanned. Remaining AA types need Access Analyzer."
+                    "Key/topic/queue/function/layer/secret/ECR/EFS/DynamoDB policies, "
+                    "KMS ListGrants, and EBS/RDS snapshot shares are scanned. "
+                    "S3 ACLs and directory buckets still need Access Analyzer."
                 ),
             },
         )
@@ -1280,7 +1712,8 @@ def build_coverage(
                 "detail": (
                     "AA does not cover RAM shares, AMI launch permissions, "
                     "SSM document shares, EventBridge/Glue/OpenSearch resource "
-                    "policies, Lambda aliases/versions, or service principals"
+                    "policies, or PrivateLink allowed principals (Trustline scans "
+                    "those separately), Lambda aliases/versions, or service principals"
                 ),
             },
         )

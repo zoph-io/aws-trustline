@@ -126,6 +126,8 @@ MECHANISM_LABELS: dict[str, str] = {
     "secretsmanager_resource_policy": "Secrets Manager resource policy",
     "ecr_repository_policy": "ECR repository policy",
     "lambda_layer_policy": "Lambda layer permission",
+    "kms_grant": "KMS cryptographic grant",
+    "eventbridge_bus_policy": "EventBridge bus policy",
 }
 
 # Where a principal's display name came from. Reports print these labels.
@@ -318,6 +320,16 @@ def source_account_from_condition(condition: dict[str, Any] | None) -> str | Non
         extracted = extract_account_id_from_iam_value(raw.strip())
         if extracted:
             return extracted
+    return None
+
+
+def org_id_from_condition(condition: dict[str, Any] | None) -> str | None:
+    """Organization ID from PrincipalOrgID / SourceOrgID when no account is named."""
+    for key in ("aws:PrincipalOrgID", "aws:SourceOrgID"):
+        for raw in _condition_values_for_key(condition, key):
+            value = raw.strip()
+            if value.startswith("o-") and len(value) >= 4:
+                return value
     return None
 
 
@@ -707,7 +719,11 @@ def parse_principal_value(
             kind="ou" if org_or_ou == "ou" else "organization",
             organization_id=org_id,
             is_our_organization=is_ours,
-            label=value,
+            label=(
+                f"OU {rest.rsplit('/', 1)[-1]}"
+                if org_or_ou == "ou"
+                else f"AWS Organization {org_id}"
+            ),
         )
         return parsed
 
@@ -841,7 +857,7 @@ def lookup_name_source(
         if vendor.get("type") == "aws-support":
             return "aws_builtin"
         return "fwd:cloudsec"
-    if parsed.get("account_id"):
+    if parsed.get("account_id") or parsed.get("organization_id"):
         return "not_in_dataset"
     return "unresolved"
 
@@ -979,18 +995,33 @@ def grant_from_parsed_principal(
     owner_account: str = "",
     owner_label: str = "",
     actions: list[str] | None = None,
+    our_organization_id: str | None = None,
 ) -> dict[str, Any] | None:
     """Build one grant row, or None if this principal is the current account."""
     condition = (statement or {}).get("Condition") or {}
     if not isinstance(condition, dict):
         condition = {}
-    if parsed.get("is_public") and condition_binds_principal(condition):
+    if (
+        parsed.get("is_public")
+        and condition_binds_principal(condition)
+        and mechanism != "access_analyzer"
+    ):
         source_acct = source_account_from_condition(condition)
-        if not source_acct:
-            # Principal:* + SourceArn/OrgId without an account ID is not public
-            # access; it is a service notification pattern we cannot name.
-            return None
-        parsed = parse_principal_value("AWS", source_acct)
+        if source_acct:
+            parsed = parse_principal_value(
+                "AWS", source_acct, our_organization_id=our_organization_id
+            )
+        else:
+            org_id = org_id_from_condition(condition)
+            if not org_id:
+                # Principal:* + SourceArn without an account ID is not public
+                # access; it is a service notification pattern we cannot name.
+                return None
+            parsed = parse_principal_value(
+                "AWS",
+                f"arn:aws:organizations::000000000000:organization/{org_id}",
+                our_organization_id=our_organization_id,
+            )
     if is_same_account_principal(parsed, current_account_id):
         return None
     classification, vendor, trusted = classify_parsed_principal(
@@ -1024,6 +1055,10 @@ def grant_from_parsed_principal(
         principal_label = f"{parsed['account_id']} ({trusted.get('name')})"
     elif parsed.get("account_id") and classification == "unknown":
         principal_label = f"{parsed['account_id']} (not in known_aws_accounts)"
+    elif parsed.get("kind") in ("organization", "ou") and classification == "trusted" and trusted:
+        principal_label = trusted.get("name") or parsed["label"]
+    elif parsed.get("kind") in ("organization", "ou") and classification == "unknown":
+        principal_label = f"{parsed['label']} (not in known_aws_accounts)"
 
     return empty_grant(
         resource=resource,
@@ -1089,6 +1124,7 @@ def grants_from_policy_document(
             owner_account=owner_account,
             owner_label=owner_label,
             actions=actions,
+            our_organization_id=our_organization_id,
         )
         if grant:
             grants.append(grant)
@@ -1211,10 +1247,10 @@ def build_coverage(
         not_scanned.insert(
             0,
             {
-                "surface": "KMS cryptographic grants (ListGrants), S3 ACLs, EFS/RDS snapshots",
+                "surface": "S3 ACLs, EFS file systems, RDS snapshots",
                 "detail": (
-                    "Key/topic/queue/function/layer/secret/ECR policies are scanned. "
-                    "KMS grants and remaining AA types need Access Analyzer."
+                    "Key/topic/queue/function/layer/secret/ECR policies and KMS "
+                    "ListGrants are scanned. Remaining AA types need Access Analyzer."
                 ),
             },
         )
@@ -1225,7 +1261,8 @@ def build_coverage(
                 "detail": (
                     "Policy scanner is Allow-principal matching. Public S3 rows "
                     "are checked with GetBucketPolicyStatus (Block Public Access). "
-                    "Principal:* with aws:SourceAccount/SourceArn is not treated as public."
+                    "Principal:* with aws:SourceAccount/SourceArn/PrincipalOrgID "
+                    "is named as that account or organization, not public."
                 ),
             },
         )
@@ -1236,7 +1273,8 @@ def build_coverage(
                 "surface": f"IAM Access Analyzer ceiling ({len(AA_SUPPORTED_TYPES)} resource types)",
                 "detail": (
                     "AA does not cover RAM shares, AMI launch permissions, "
-                    "SSM document shares, Lambda aliases/versions, or service principals"
+                    "SSM document shares, EventBridge bus policies, Lambda "
+                    "aliases/versions, or service principals"
                 ),
             },
         )

@@ -298,6 +298,80 @@ class TrustPolicyGrantTests(unittest.TestCase):
                 "Statement": {
                     "Effect": "Allow",
                     "Principal": "*",
+                    "Action": "SNS:Publish",
+                    "Condition": {
+                        "ArnLike": {
+                            "aws:SourceArn": "arn:aws:s3:::example-bucket"
+                        }
+                    },
+                }
+            },
+            resource="arn:aws:sns:eu-west-1:111122223333:events",
+            resource_type="AWS::SNS::Topic",
+            mechanism="sns_topic_policy",
+            trusted_accounts={},
+            account_to_vendor={},
+            current_account_id="111122223333",
+        )
+        self.assertEqual(grants, [])
+
+    def test_star_with_our_org_id_is_this_organization(self):
+        grants = grants_from_policy_document(
+            {
+                "Statement": {
+                    "Effect": "Allow",
+                    "Principal": "*",
+                    "Action": "events:PutEvents",
+                    "Condition": {
+                        "StringEquals": {"aws:PrincipalOrgID": "o-ours"}
+                    },
+                }
+            },
+            resource="arn:aws:events:eu-west-1:111122223333:event-bus/default",
+            resource_type="AWS::Events::EventBus",
+            mechanism="eventbridge_bus_policy",
+            trusted_accounts={},
+            account_to_vendor={},
+            current_account_id="111122223333",
+            our_organization_id="o-ours",
+        )
+        self.assertEqual(len(grants), 1)
+        self.assertFalse(grants[0]["is_public"])
+        self.assertEqual(grants[0]["classification"], "trusted")
+        self.assertEqual(grants[0]["principal_label"], "This AWS Organization")
+        self.assertEqual(grants[0]["organization_id"], "o-ours")
+
+    def test_star_with_foreign_org_id_is_unknown_org(self):
+        grants = grants_from_policy_document(
+            {
+                "Statement": {
+                    "Effect": "Allow",
+                    "Principal": "*",
+                    "Action": "events:PutEvents",
+                    "Condition": {
+                        "StringEquals": {"aws:PrincipalOrgID": "o-foreign"}
+                    },
+                }
+            },
+            resource="arn:aws:events:eu-west-1:111122223333:event-bus/default",
+            resource_type="AWS::Events::EventBus",
+            mechanism="eventbridge_bus_policy",
+            trusted_accounts={},
+            account_to_vendor={},
+            current_account_id="111122223333",
+            our_organization_id="o-ours",
+        )
+        self.assertEqual(len(grants), 1)
+        self.assertEqual(grants[0]["classification"], "unknown")
+        self.assertIn("o-foreign", grants[0]["principal_label"])
+        self.assertIn("not in known_aws_accounts", grants[0]["principal_label"])
+
+    def test_star_with_lambda_source_arn_only_is_not_public(self):
+        grants = grants_from_policy_document(
+            {
+                "Statement": {
+                    "Effect": "Allow",
+                    "Principal": "*",
                     "Action": "lambda:InvokeFunction",
                     "Condition": {
                         "ArnLike": {

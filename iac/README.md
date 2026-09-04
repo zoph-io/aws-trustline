@@ -1,7 +1,7 @@
 # AWS Trustline scheduled scanner (Lambda + EventBridge + S3)
 
 Deploy [AWS Trustline](../README.md) as a scheduled AWS Lambda. Grant rows from
-IAM Access Analyzer (plus RAM / AMI / SSM / credentials) are classified against
+IAM Access Analyzer (plus RAM / AMI / SSM / credentials / EventBridge bus policies) are classified against
 the [fwd:cloudsec](https://github.com/fwdcloudsec/known_aws_accounts) vendor
 dataset. The HTML report leads with an inventory grouped by principal (names
 from fwd:cloudsec / Organizations), ends with a collapsed coverage appendix,

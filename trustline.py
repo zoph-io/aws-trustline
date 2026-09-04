@@ -70,7 +70,7 @@ from grants import (
     totals_from_grants,
 )
 
-__version__ = "0.4.3"
+__version__ = "0.4.4"
 
 REFERENCE_DATA_URL = (
     "https://raw.githubusercontent.com/fwdcloudsec/known_aws_accounts/main/accounts.yaml"
@@ -433,6 +433,38 @@ def _grants_from_resource_policy(
     )
 
 
+def _grant_from_principal_string(
+    value: str,
+    *,
+    resource: str,
+    resource_type: str,
+    mechanism: str,
+    region: str,
+    kwargs: dict[str, Any],
+    actions: list[str] | None = None,
+) -> dict[str, Any] | None:
+    if not value or is_aws_service_principal(value):
+        return None
+    parsed = parse_principal_value(
+        "AWS", value, our_organization_id=kwargs.get("our_organization_id")
+    )
+    return grant_from_parsed_principal(
+        parsed,
+        statement=None,
+        resource=resource,
+        resource_type=resource_type,
+        mechanism=mechanism,
+        trusted_accounts=kwargs["trusted_accounts"],
+        account_to_vendor=kwargs["account_to_vendor"],
+        current_account_id=kwargs["current_account_id"],
+        region=region,
+        owner_account=kwargs["owner_account"],
+        owner_label=kwargs["owner_label"],
+        actions=actions,
+        our_organization_id=kwargs.get("our_organization_id"),
+    )
+
+
 def _collect_kms_in_region(
     session: boto3.Session, region: str, kwargs: dict[str, Any]
 ) -> tuple[str, list[dict[str, Any]], str | None]:
@@ -461,6 +493,29 @@ def _collect_kms_in_region(
                             kwargs=kwargs,
                         )
                     )
+                    try:
+                        grant_pages = client.get_paginator("list_grants")
+                        for gpage in grant_pages.paginate(KeyId=key_id):
+                            for entry in gpage.get("Grants") or []:
+                                if entry.get("GranteeServicePrincipal"):
+                                    continue
+                                row = _grant_from_principal_string(
+                                    (entry.get("GranteePrincipal") or "").strip(),
+                                    resource=arn,
+                                    resource_type="AWS::KMS::Key",
+                                    mechanism="kms_grant",
+                                    region=region,
+                                    kwargs=kwargs,
+                                    actions=[
+                                        op
+                                        for op in (entry.get("Operations") or [])
+                                        if isinstance(op, str)
+                                    ],
+                                )
+                                if row:
+                                    grants.append(row)
+                    except ClientError:
+                        pass
                 except ClientError:
                     continue
         return region, grants, None
@@ -684,13 +739,60 @@ def _collect_ecr_in_region(
 
 
 RESOURCE_POLICY_COLLECTORS: tuple[tuple[str, str, Any], ...] = (
-    ("KMS key policies", "KMS", _collect_kms_in_region),
+    ("KMS key policies and grants", "KMS", _collect_kms_in_region),
     ("SNS topic policies", "SNS", _collect_sns_in_region),
     ("SQS queue policies", "SQS", _collect_sqs_in_region),
     ("Lambda resource policies", "Lambda", _collect_lambda_in_region),
     ("Lambda layer permissions", "Lambda layers", _collect_lambda_layers_in_region),
     ("Secrets Manager resource policies", "Secrets", _collect_secrets_in_region),
     ("ECR repository policies", "ECR", _collect_ecr_in_region),
+)
+
+
+def _collect_eventbridge_in_region(
+    session: boto3.Session, region: str, kwargs: dict[str, Any]
+) -> tuple[str, list[dict[str, Any]], str | None]:
+    grants: list[dict[str, Any]] = []
+    try:
+        client = session.client("events", region_name=region, config=AA_CLIENT_CONFIG)
+        buses: list[dict[str, Any]] = []
+        token: str | None = None
+        while True:
+            kwargs_api: dict[str, Any] = {}
+            if token:
+                kwargs_api["NextToken"] = token
+            resp = client.list_event_buses(**kwargs_api)
+            buses.extend(resp.get("EventBuses") or [])
+            token = resp.get("NextToken")
+            if not token:
+                break
+        for bus in buses:
+            name = bus.get("Name") or "default"
+            arn = bus.get("Arn") or name
+            try:
+                detail = client.describe_event_bus(Name=name)
+            except ClientError:
+                continue
+            grants.extend(
+                _grants_from_resource_policy(
+                    loads_policy_document(detail.get("Policy")),
+                    resource=arn,
+                    resource_type="AWS::Events::EventBus",
+                    mechanism="eventbridge_bus_policy",
+                    region=region,
+                    kwargs=kwargs,
+                )
+            )
+        return region, grants, None
+    except ClientError as e:
+        return region, [], e.response["Error"]["Message"]
+    except (BotoCoreError, Exception) as e:
+        return region, [], str(e)
+
+
+# Surfaces IAM Access Analyzer does not reason about. Run on both backends.
+BEYOND_AA_COLLECTORS: tuple[tuple[str, str, Any], ...] = (
+    ("EventBridge bus policies", "EventBridge", _collect_eventbridge_in_region),
 )
 
 
@@ -701,7 +803,8 @@ def collect_resource_policy_grants(
 ) -> tuple[list[dict[str, Any]], list[dict[str, str]], list[dict[str, str]]]:
     """Walk AA-class resource policies when Access Analyzer is not used.
 
-    Allow-principal matching only (no Deny, BPA, or KMS cryptographic grants).
+    Allow-principal matching. Customer-managed KMS keys also run ListGrants
+    (Access Analyzer already reasons about key policies *and* grants).
     """
     grants: list[dict[str, Any]] = []
     scanned: list[dict[str, str]] = []
@@ -718,6 +821,42 @@ def collect_resource_policy_grants(
         return grants, scanned, skipped
 
     for surface, prefix, worker in RESOURCE_POLICY_COLLECTORS:
+        console.print(
+            f"[bold blue]Checking {surface} in {len(regions)} region(s)...[/bold blue]"
+        )
+        region_grants, failures = _run_regional_collector(
+            session, regions, worker, kwargs, warning_prefix=prefix
+        )
+        grants.extend(region_grants)
+        failed_ids = {region for region, _ in failures}
+        ok_regions = [region for region in regions if region not in failed_ids]
+        if ok_regions:
+            scanned.append({"surface": surface, "detail": ", ".join(ok_regions)})
+        for region, error in failures:
+            skipped.append({"surface": f"{surface} ({region})", "detail": error})
+        console.print(f"[green]{surface}: {len(region_grants)} grant(s)[/green]")
+    return grants, scanned, skipped
+
+
+def collect_beyond_aa_grants(
+    session: boto3.Session,
+    regions: list[str],
+    **kwargs: Any,
+) -> tuple[list[dict[str, Any]], list[dict[str, str]], list[dict[str, str]]]:
+    """Walk resource policies Access Analyzer does not cover (both backends)."""
+    grants: list[dict[str, Any]] = []
+    scanned: list[dict[str, str]] = []
+    skipped: list[dict[str, str]] = []
+    if not regions:
+        skipped.append(
+            {
+                "surface": "EventBridge bus policies",
+                "detail": "No region configured; pass --region / --regions / --all-regions",
+            }
+        )
+        return grants, scanned, skipped
+
+    for surface, prefix, worker in BEYOND_AA_COLLECTORS:
         console.print(
             f"[bold blue]Checking {surface} in {len(regions)} region(s)...[/bold blue]"
         )
@@ -1129,7 +1268,7 @@ def collect_optional_scanners(
     regions: list[str],
     kwargs: dict[str, Any],
 ) -> tuple[list[dict[str, Any]], list[dict[str, str]], list[dict[str, str]]]:
-    """RAM / AMI / SSM / credentials collectors shared by both backends."""
+    """RAM / AMI / SSM / credentials / EventBridge collectors shared by both backends."""
     grants: list[dict[str, Any]] = []
     scanned: list[dict[str, str]] = []
     skipped: list[dict[str, str]] = []
@@ -1190,6 +1329,12 @@ def collect_optional_scanners(
                 "detail": "account-wide (CodeCommit, Keyspaces, Bedrock, CloudWatch, Claude)",
             }
         )
+    extra, extra_scanned, extra_skipped = collect_beyond_aa_grants(
+        session, regions, **kwargs
+    )
+    grants.extend(extra)
+    scanned.extend(extra_scanned)
+    skipped.extend(extra_skipped)
     return grants, scanned, skipped
 
 
@@ -2035,6 +2180,7 @@ def _classify_aa_finding(
         owner_account=resource_owner,
         owner_label=_owner_label(resource_owner, account_aliases, org_accounts),
         actions=list(actions) if isinstance(actions, list) else [],
+        our_organization_id=our_organization_id,
     )
     if grant is None:
         return None
@@ -2897,7 +3043,8 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Skip KMS, SNS, SQS, Lambda, Lambda layer, Secrets Manager, and ECR "
-            "resource policies (policy scanner only; Access Analyzer already covers these types)"
+            "resource policies (policy scanner only; Access Analyzer already covers "
+            "these types). Also skips KMS ListGrants on the policy scanner."
         ),
     )
     parser.add_argument("--skip-ram", action="store_true", help="Skip RAM resource shares")

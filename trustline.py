@@ -70,7 +70,7 @@ from grants import (
     totals_from_grants,
 )
 
-__version__ = "0.4.2"
+__version__ = "0.4.3"
 
 REFERENCE_DATA_URL = (
     "https://raw.githubusercontent.com/fwdcloudsec/known_aws_accounts/main/accounts.yaml"
@@ -605,12 +605,92 @@ def _collect_secrets_in_region(
         return region, [], str(e)
 
 
+def _collect_lambda_layers_in_region(
+    session: boto3.Session, region: str, kwargs: dict[str, Any]
+) -> tuple[str, list[dict[str, Any]], str | None]:
+    grants: list[dict[str, Any]] = []
+    try:
+        client = session.client("lambda", region_name=region, config=AA_CLIENT_CONFIG)
+        paginator = client.get_paginator("list_layers")
+        for page in paginator.paginate():
+            for layer in page.get("Layers") or []:
+                name = layer.get("LayerName") or ""
+                try:
+                    versions = (
+                        client.list_layer_versions(LayerName=name).get("LayerVersions")
+                        or []
+                    )
+                except ClientError:
+                    continue
+                # Newest first. Older versions with leftover policies still
+                # grant access; cap so accounts with hundreds of versions stay
+                # scannable.
+                for version in versions[:25]:
+                    ver = version.get("Version")
+                    arn = version.get("LayerVersionArn") or f"{name}:{ver}"
+                    try:
+                        raw = client.get_layer_version_policy(
+                            LayerName=name, VersionNumber=ver
+                        ).get("Policy")
+                    except ClientError:
+                        continue
+                    grants.extend(
+                        _grants_from_resource_policy(
+                            loads_policy_document(raw),
+                            resource=arn,
+                            resource_type="AWS::Lambda::LayerVersion",
+                            mechanism="lambda_layer_policy",
+                            region=region,
+                            kwargs=kwargs,
+                        )
+                    )
+        return region, grants, None
+    except ClientError as e:
+        return region, [], e.response["Error"]["Message"]
+    except (BotoCoreError, Exception) as e:
+        return region, [], str(e)
+
+
+def _collect_ecr_in_region(
+    session: boto3.Session, region: str, kwargs: dict[str, Any]
+) -> tuple[str, list[dict[str, Any]], str | None]:
+    grants: list[dict[str, Any]] = []
+    try:
+        client = session.client("ecr", region_name=region, config=AA_CLIENT_CONFIG)
+        paginator = client.get_paginator("describe_repositories")
+        for page in paginator.paginate():
+            for repo in page.get("repositories") or []:
+                name = repo.get("repositoryName") or ""
+                arn = repo.get("repositoryArn") or name
+                try:
+                    raw = client.get_repository_policy(repositoryName=name).get("policyText")
+                except ClientError:
+                    continue
+                grants.extend(
+                    _grants_from_resource_policy(
+                        loads_policy_document(raw),
+                        resource=arn,
+                        resource_type="AWS::ECR::Repository",
+                        mechanism="ecr_repository_policy",
+                        region=region,
+                        kwargs=kwargs,
+                    )
+                )
+        return region, grants, None
+    except ClientError as e:
+        return region, [], e.response["Error"]["Message"]
+    except (BotoCoreError, Exception) as e:
+        return region, [], str(e)
+
+
 RESOURCE_POLICY_COLLECTORS: tuple[tuple[str, str, Any], ...] = (
     ("KMS key policies", "KMS", _collect_kms_in_region),
     ("SNS topic policies", "SNS", _collect_sns_in_region),
     ("SQS queue policies", "SQS", _collect_sqs_in_region),
     ("Lambda resource policies", "Lambda", _collect_lambda_in_region),
+    ("Lambda layer permissions", "Lambda layers", _collect_lambda_layers_in_region),
     ("Secrets Manager resource policies", "Secrets", _collect_secrets_in_region),
+    ("ECR repository policies", "ECR", _collect_ecr_in_region),
 )
 
 
@@ -629,7 +709,9 @@ def collect_resource_policy_grants(
     if not regions:
         skipped.append(
             {
-                "surface": "KMS / SNS / SQS / Lambda / Secrets Manager policies",
+                "surface": (
+                    "KMS / SNS / SQS / Lambda / Lambda layer / Secrets / ECR policies"
+                ),
                 "detail": "No region configured; pass --region / --regions / --all-regions",
             }
         )
@@ -1163,6 +1245,7 @@ def _party_resource_summary(party: dict[str, Any], *, limit: int = 6) -> str:
         names = [grant_resource_label(g) for g in items]
     else:
         names = [grant_resource_label({"resource": r}) for r in (party.get("resources") or []) if r]
+    names = list(dict.fromkeys(names))
     if len(names) > limit:
         return ", ".join(names[:limit]) + f" +{len(names) - limit} more"
     return ", ".join(names) or "—"
@@ -1385,7 +1468,11 @@ def display_grants(
             box=box.ROUNDED,
         )
     )
-    scanned_bit = ", ".join(item["surface"] for item in (coverage.get("scanned") or [])[:6])
+    scanned_names = [item["surface"] for item in (coverage.get("scanned") or [])]
+    if len(scanned_names) > 8:
+        scanned_bit = ", ".join(scanned_names[:8]) + f" +{len(scanned_names) - 8} more"
+    else:
+        scanned_bit = ", ".join(scanned_names)
     aa_note = ""
     if coverage.get("backend") == "access_analyzer":
         aa_note = " Analyzer ACTIVE is not scan-complete."
@@ -2119,6 +2206,9 @@ a:hover { color: var(--accent); }
 .kpi-sub { font-size: 11px; color: var(--text-dim); margin-top: 6px; }
 .kpi.danger { border-color: var(--accent-border); }
 .kpi.danger .kpi-value { color: var(--accent-text); }
+.kpi.kpi-filter { cursor: pointer; }
+.kpi.kpi-filter:hover { border-color: var(--border-strong); }
+.kpi.kpi-filter.danger:hover { border-color: var(--accent); }
 .section {
   border: 1px solid var(--border);
   border-radius: 8px;
@@ -2217,6 +2307,28 @@ tbody tr:hover { background: rgba(39, 39, 42, 0.5); }
 }
 .resource-cell .arn { color: var(--text); font-weight: 500; }
 .resource-cell .region { color: var(--text-dim); font-size: 11px; margin-top: 2px; }
+.filter-bar {
+  display: flex; flex-wrap: wrap; gap: 8px;
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg);
+}
+.filter-bar button {
+  font-family: var(--mono);
+  font-size: 10px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 0.08em;
+  background: transparent;
+  color: var(--text-muted);
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  padding: 4px 10px;
+  cursor: pointer;
+}
+.filter-bar button:hover { color: var(--text); }
+.filter-bar button.active {
+  color: var(--text);
+  border-color: var(--accent);
+}
 .footer {
   padding: 32px 0 48px;
   color: var(--text-dim);
@@ -2343,15 +2455,49 @@ def _html_actions_cell(actions: list[str]) -> str:
     return f'<div class="tags">{tags}</div>'
 
 
-def _render_kpi(label: str, value: Any, sub: str = "", danger: bool = False) -> str:
+def _render_kpi(
+    label: str,
+    value: Any,
+    sub: str = "",
+    danger: bool = False,
+    filter_class: str | None = None,
+) -> str:
     klass = "kpi danger" if danger else "kpi"
+    attrs = ""
+    if filter_class is not None:
+        klass += " kpi-filter"
+        attrs = (
+            f' data-filter="{_h(filter_class)}" role="button" tabindex="0" '
+            'title="Filter inventory by this classification"'
+        )
     sub_html = f'<div class="kpi-sub">{_h(sub)}</div>' if sub else ""
     return (
-        f'<div class="{klass}">'
+        f'<div class="{klass}"{attrs}>'
         f'<div class="kpi-label">{_h(label)}</div>'
         f'<div class="kpi-value">{_h(value)}</div>'
         f"{sub_html}"
         "</div>"
+    )
+
+
+_INVENTORY_FILTER_ORDER = ("unknown", "public", "vendor", "federated", "trusted")
+
+
+def _inventory_filter_bar(parties: list[dict[str, Any]]) -> str:
+    present = {p.get("classification") or "unknown" for p in parties}
+    buttons = [
+        '<button type="button" data-filter="all" class="active">All</button>'
+    ]
+    for classification in _INVENTORY_FILTER_ORDER:
+        if classification in present:
+            buttons.append(
+                f'<button type="button" data-filter="{_h(classification)}">'
+                f"{_h(classification)}</button>"
+            )
+    return (
+        '<div class="filter-bar" id="class-filter" role="toolbar" '
+        'aria-label="Filter by classification">'
+        f"{''.join(buttons)}</div>"
     )
 
 
@@ -2363,6 +2509,8 @@ def _render_section(
     subtitle: str = "",
     empty_message: str = "",
     neutral: bool = False,
+    table_id: str = "",
+    toolbar_html: str = "",
 ) -> str:
     header_class = "section-header neutral" if neutral else "section-header"
     sub_html = f'<div class="section-sub">{_h(subtitle)}</div>' if subtitle else ""
@@ -2370,9 +2518,11 @@ def _render_section(
         body = f'<div class="section-body empty">{_h(empty_message or "No findings.")}</div>'
     else:
         header_cells = "".join(f"<th>{_h(c)}</th>" for c in columns)
+        tid = f' id="{_h(table_id)}"' if table_id else ""
         body = (
+            f"{toolbar_html}"
             '<div class="section-body">'
-            f'<table><thead><tr>{header_cells}</tr></thead><tbody>{rows_html}</tbody></table>'
+            f"<table{tid}><thead><tr>{header_cells}</tr></thead><tbody>{rows_html}</tbody></table>"
             "</div>"
         )
     return (
@@ -2402,6 +2552,27 @@ def _html_document(*, title: str, header_html: str, body_html: str) -> str:
         '<main class="container">\n'
         f"{body_html}\n"
         "</main>\n"
+        "<script>"
+        "(function(){"
+        'var table=document.getElementById("inventory-table");'
+        'var bar=document.getElementById("class-filter");'
+        "if(!table)return;"
+        "function applyFilter(filter){"
+        "if(bar){bar.querySelectorAll('button').forEach(function(b){"
+        "b.classList.toggle('active',b.getAttribute('data-filter')===filter);});}"
+        "table.querySelectorAll('tbody tr').forEach(function(row){"
+        "row.style.display=(filter==='all'||row.getAttribute('data-class')===filter)?'':'none';"
+        "});}"
+        "if(bar){bar.addEventListener('click',function(e){"
+        "var btn=e.target.closest('button');if(!btn)return;"
+        "applyFilter(btn.getAttribute('data-filter')||'all');});}"
+        "document.querySelectorAll('.kpi[data-filter]').forEach(function(kpi){"
+        "kpi.addEventListener('click',function(){applyFilter(kpi.getAttribute('data-filter')||'all');});"
+        "kpi.addEventListener('keydown',function(e){"
+        "if(e.key==='Enter'||e.key===' '){e.preventDefault();applyFilter(kpi.getAttribute('data-filter')||'all');}"
+        "});});"
+        "})();"
+        "</script>\n"
         '<footer class="footer container">'
         'Generated by <a href="https://github.com/zoph-io/aws-trustline" target="_blank" rel="noopener noreferrer">AWS Trustline</a>'
         ' &middot; design inspired by <a href="https://iamtrail.com" target="_blank" rel="noopener noreferrer">iamtrail.com</a>'
@@ -2522,12 +2693,44 @@ def generate_html_report(
     )
     kpis_html = (
         '<div class="kpis">'
-        + _render_kpi("External parties", ptotals["parties"], "Grouped by account ID or issuer")
-        + _render_kpi("Unknown parties", ptotals["unknown"], "Looked up, no name", danger=ptotals["unknown"] > 0)
-        + _render_kpi("Public parties", ptotals["public"], "Currently shared with *", danger=ptotals["public"] > 0)
-        + _render_kpi("Vendor parties", ptotals["vendor"], "fwd:cloudsec + AWS aliases")
-        + _render_kpi("Trusted parties", ptotals["trusted"], "Org + YAML + CloudFront")
-        + _render_kpi("Federated parties", ptotals["federated"], "OIDC / SAML / Cognito")
+        + _render_kpi(
+            "External parties",
+            ptotals["parties"],
+            "Grouped by account ID or issuer",
+            filter_class="all",
+        )
+        + _render_kpi(
+            "Unknown parties",
+            ptotals["unknown"],
+            "Looked up, no name",
+            danger=ptotals["unknown"] > 0,
+            filter_class="unknown",
+        )
+        + _render_kpi(
+            "Public parties",
+            ptotals["public"],
+            "Currently shared with *",
+            danger=ptotals["public"] > 0,
+            filter_class="public",
+        )
+        + _render_kpi(
+            "Vendor parties",
+            ptotals["vendor"],
+            "fwd:cloudsec + AWS aliases",
+            filter_class="vendor",
+        )
+        + _render_kpi(
+            "Trusted parties",
+            ptotals["trusted"],
+            "Org + YAML + CloudFront",
+            filter_class="trusted",
+        )
+        + _render_kpi(
+            "Federated parties",
+            ptotals["federated"],
+            "OIDC / SAML / Cognito",
+            filter_class="federated",
+        )
         + _render_kpi("Missing ExternalId", totals["missing_external_id"], "Confused deputy (grants)", danger=totals["missing_external_id"] > 0)
         + _render_kpi("OIDC gaps", totals["missing_oidc_subject"], "Missing sub/aud (grants)", danger=totals["missing_oidc_subject"] > 0)
         + "</div>"
@@ -2551,7 +2754,7 @@ def generate_html_report(
         )
 
     party_rows = "".join(
-        "<tr>"
+        f'<tr data-class="{_h(party["classification"])}">'
         f"<td>{_h(party['name'])}</td>"
         f"<td class=\"muted\">{_h(party['name_source_label'])}</td>"
         f"<td>{_html_pill(party['classification'], _party_pill_kind(party['classification']))}</td>"
@@ -2566,9 +2769,15 @@ def generate_html_report(
             "External access by principal",
             party_rows,
             ["Principal", "Name source", "Classification", "Grants", "Mechanisms", "Resources"],
-            subtitle=f"{len(parties)} external part{'y' if len(parties) == 1 else 'ies'}",
+            subtitle=(
+                f"{len(parties)} external part"
+                f"{'y' if len(parties) == 1 else 'ies'}. "
+                "Filter by classification, or click a party KPI."
+            ),
             empty_message="No current external access in scanned surfaces.",
             neutral=True,
+            table_id="inventory-table",
+            toolbar_html=_inventory_filter_bar(parties),
         )
     else:
         inventory_html = (
@@ -2687,8 +2896,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--skip-resource-policies",
         action="store_true",
         help=(
-            "Skip KMS key, SNS, SQS, Lambda, and Secrets Manager resource policies "
-            "(policy scanner only; Access Analyzer already covers these types)"
+            "Skip KMS, SNS, SQS, Lambda, Lambda layer, Secrets Manager, and ECR "
+            "resource policies (policy scanner only; Access Analyzer already covers these types)"
         ),
     )
     parser.add_argument("--skip-ram", action="store_true", help="Skip RAM resource shares")
@@ -2971,7 +3180,9 @@ def _run_policy_scanner(
     if getattr(args, "skip_resource_policies", False):
         skipped.append(
             {
-                "surface": "KMS / SNS / SQS / Lambda / Secrets Manager policies",
+                "surface": (
+                    "KMS / SNS / SQS / Lambda / Lambda layer / Secrets / ECR policies"
+                ),
                 "detail": "--skip-resource-policies",
             }
         )

@@ -6,7 +6,7 @@ Trustline collects **grant rows** (one resource × one principal × one mechanis
 
 ## How to read a report
 
-The first table is the **inventory**: one row per external party, with the resolved name and which directory produced it. The Resources column includes the AWS type when the last ARN segment is a UUID, a short digit, or not an IAM role / S3 bucket name.
+The first table is the **inventory**: one row per external party, with the resolved name and which directory produced it. The Resources column includes the AWS type when the last ARN segment is a UUID, a short digit, or not an IAM role / S3 bucket name. The HTML report filters that table by classification (chips under the heading, or click a party KPI).
 
 | Classification | Meaning |
 |---|---|
@@ -95,7 +95,7 @@ flowchart LR
     A["fwd:cloudsec<br/>Known Accounts"] --> D[Trustline]
     B[AWS Organizations] --> D
     C[trusted_accounts.yaml] --> D
-    D --> P["Policy scanner if no AA<br/>IAM / S3 / KMS / SNS / SQS / Lambda / Secrets"]
+    D --> P["Policy scanner if no AA<br/>IAM / S3 / KMS / SNS / SQS / Lambda / layers / Secrets / ECR"]
     D --> AA["Access Analyzer<br/>when present"]
     D --> X["RAM / AMI / SSM / API keys"]
     P --> G["Grant rows"]
@@ -105,15 +105,15 @@ flowchart LR
 ```
 
 1. Load vendor IDs (fwd:cloudsec, cached under `~/.cache/aws-trustline/`), Organization members and org ID (if allowed), and YAML trusted accounts.
-2. If an **ACCOUNT** Access Analyzer exists in the requested regions, use it for IAM/S3-class resources. If only an ORGANIZATION analyzer exists, use it but **keep findings owned by this account** (pass `--scope organization` for the whole org). Otherwise walk IAM trusts, S3 bucket policies, and KMS/SNS/SQS/Lambda/Secrets Manager resource policies. RAM, AMI, SSM, and credentials always run unless skipped.
+2. If an **ACCOUNT** Access Analyzer exists in the requested regions, use it for IAM/S3-class resources. If only an ORGANIZATION analyzer exists, use it but **keep findings owned by this account** (pass `--scope organization` for the whole org). Otherwise walk IAM trusts, S3 bucket policies, and KMS / SNS / SQS / Lambda / Lambda layer / Secrets Manager / ECR resource policies. RAM, AMI, SSM, and credentials always run unless skipped.
 3. Classify each grant and **group by principal**. Resolve 12-digit IDs. CloudFront OAI/OAC is trusted AWS (one party). Flag missing ExternalId, GitHub/GitLab `sub`/`aud`, and never-expiring credentials. Policy-scanner public S3 is checked with `GetBucketPolicyStatus`. Access Analyzer leftover flags for IAM roles are taken from the live trust policy (`iam:GetRole`), not from findings that omit Condition.
 4. Print the inventory, then leftover flags. Coverage is an appendix.
 
-Mechanisms: trust policy, S3 bucket policy, KMS/SNS/SQS/Lambda/Secrets Manager resource policy, RAM share, AMI launch permission, SSM document share, service-specific credential, or Access Analyzer finding.
+Mechanisms: trust policy, S3 bucket policy, KMS/SNS/SQS/Lambda/Lambda layer/Secrets Manager/ECR resource policy, RAM share, AMI launch permission, SSM document share, service-specific credential, or Access Analyzer finding.
 
 ## Usage
 
-Default: **use Access Analyzer when one exists** (effective access for AA resource types). `--scope auto` (default) **prefers ACCOUNT analyzers** so the inventory is this account. ORGANIZATION analyzers are used only when no ACCOUNT analyzer exists in that region, and those findings are still limited to this account unless you pass `--scope organization`. If none exists, walk IAM trusts, S3 bucket policies, and KMS / SNS / SQS / Lambda / Secrets Manager resource policies. RAM, AMI, SSM, and service-specific credentials run in both cases unless skipped.
+Default: **use Access Analyzer when one exists** (effective access for AA resource types). `--scope auto` (default) **prefers ACCOUNT analyzers** so the inventory is this account. ORGANIZATION analyzers are used only when no ACCOUNT analyzer exists in that region, and those findings are still limited to this account unless you pass `--scope organization`. If none exists, walk IAM trusts, S3 bucket policies, and KMS / SNS / SQS / Lambda / Lambda layer / Secrets Manager / ECR resource policies. RAM, AMI, SSM, and service-specific credentials run in both cases unless skipped.
 
 ```bash
 python trustline.py
@@ -160,7 +160,7 @@ With `--scope organization`, findings are grouped by `resourceOwnerAccount` usin
 | `--trusted-accounts` | `-t` | YAML path (default: `trusted_accounts.yaml`) |
 | `--skip-iam` | | Skip IAM role trusts (policy scanner only) |
 | `--skip-s3` | | Skip S3 bucket policies (policy scanner only) |
-| `--skip-resource-policies` | | Skip KMS/SNS/SQS/Lambda/Secrets Manager resource policies (policy scanner only) |
+| `--skip-resource-policies` | | Skip KMS/SNS/SQS/Lambda/layer/Secrets/ECR resource policies (policy scanner only) |
 | `--skip-ram` | | Skip RAM resource shares |
 | `--skip-ami` | | Skip AMI launch permissions |
 | `--skip-ssm` | | Skip SSM document shares |
@@ -222,7 +222,7 @@ Not scanned (always listed):
 - Copies, replication, and DLM share rules
 - SES sending authorization
 
-The **policy scanner** does not evaluate Deny. `Principal: "*"` with `aws:SourceAccount` / `aws:SourceArn` is not treated as public (SNS/Lambda notification pattern); a SourceAccount is named as that party instead. It walks KMS key, SNS, SQS, Lambda, and Secrets Manager resource policies (Allow-principal matching). It still does not cover KMS cryptographic grants (`ListGrants`), S3 ACLs, ECR, EFS, or RDS snapshots. Public S3 `Allow *` is checked with `GetBucketPolicyStatus`.
+The **policy scanner** does not evaluate Deny. `Principal: "*"` with `aws:SourceAccount` / `aws:SourceArn` is not treated as public (SNS/Lambda notification pattern); a SourceAccount is named as that party instead. It walks KMS key, SNS, SQS, Lambda function, Lambda layer (up to 25 newest versions per layer), Secrets Manager, and ECR repository resource policies (Allow-principal matching). It still does not cover KMS cryptographic grants (`ListGrants`), S3 ACLs, EFS, or RDS snapshots. Public S3 `Allow *` is checked with `GetBucketPolicyStatus`.
 
 **Access Analyzer** only reasons about [its documented resource types](https://docs.aws.amazon.com/IAM/latest/UserGuide/access-analyzer-resources.html) (S3, IAM roles, KMS, Lambda, SQS, …). RAM shares, AMI launch permissions, and SSM document shares are outside that ceiling; Trustline scans those separately. Lambda aliases/versions and service principals stay not-scanned. Organization-scope analyzers treat sibling accounts as in-zone-of-trust, so they will not appear as AA findings. Duplicate findings for the same IAM role from two analyzers are collapsed. The appendix prints the exact type list the tool uses.
 
@@ -233,7 +233,7 @@ Default is **hybrid**: Access Analyzer when one exists, otherwise the policy sca
 | Aspect | Policy scanner (`--policy-scanner` or no analyzer) | Access Analyzer (default when found) |
 |---|---|---|
 | Setup | Runs immediately | Needs an existing external analyzer (free) |
-| IAM / S3-class coverage | IAM trusts, S3 buckets, KMS keys, SNS, SQS, Lambda, Secrets Manager | [AA-supported types](https://docs.aws.amazon.com/IAM/latest/UserGuide/access-analyzer-resources.html) |
+| IAM / S3-class coverage | IAM trusts, S3 buckets, KMS keys, SNS, SQS, Lambda, layers, Secrets Manager, ECR | [AA-supported types](https://docs.aws.amazon.com/IAM/latest/UserGuide/access-analyzer-resources.html) |
 | RAM / AMI / SSM / API keys | Yes (unless `--skip-*`) | Yes (unless `--skip-*`) |
 | Cross-account accuracy | Allow-principal matching; S3 public checked via GetBucketPolicyStatus | Provable reasoning (Deny, conditions, BPA, org zone-of-trust) |
 | Report | Inventory by principal; unresolved IDs labeled | Same inventory |
@@ -275,8 +275,13 @@ Default is **hybrid**: Access Analyzer when one exists, otherwise the policy sca
         "sqs:GetQueueAttributes",
         "lambda:ListFunctions",
         "lambda:GetPolicy",
+        "lambda:ListLayers",
+        "lambda:ListLayerVersions",
+        "lambda:GetLayerVersionPolicy",
         "secretsmanager:ListSecrets",
-        "secretsmanager:GetResourcePolicy"
+        "secretsmanager:GetResourcePolicy",
+        "ecr:DescribeRepositories",
+        "ecr:GetRepositoryPolicy"
       ],
       "Resource": "*"
     },

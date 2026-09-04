@@ -1,6 +1,6 @@
 [project]
 name = "aws-trustline"
-version = "0.4.2"
+version = "0.4.3"
 description = "Map current external access in an AWS account and name known account IDs"
 readme = "README.md"
 license = "Apache-2.0"

@@ -805,6 +805,18 @@ class ResourceLabelTests(unittest.TestCase):
         )
         self.assertEqual(label, "GhA-Example")
 
+    def test_lambda_layer_uses_name_and_version(self):
+        label = grant_resource_label(
+            {
+                "resource": (
+                    "arn:aws:lambda:eu-west-1:111122223333:layer:shared-lib:7"
+                ),
+                "resource_type": "AWS::Lambda::LayerVersion",
+            }
+        )
+        self.assertIn("shared-lib:7", label)
+        self.assertIn("Lambda LayerVersion", label)
+
 
 class OidcConditionShapeTests(unittest.TestCase):
     def test_aa_flat_condition_keys_count_as_present(self):
@@ -878,6 +890,61 @@ class DedupeAccessAnalyzerTests(unittest.TestCase):
         self.assertEqual(dropped, 1)
         self.assertEqual(len(kept), 1)
         self.assertEqual(kept[0]["analyzer_type"], "ACCOUNT")
+
+
+class InventoryPresentationTests(unittest.TestCase):
+    def test_duplicate_lambda_grants_collapse_to_one_resource_name(self):
+        from trustline import _party_resource_summary
+
+        party = {
+            "grants": [
+                {
+                    "resource": "arn:aws:lambda:eu-west-1:111122223333:function:fn",
+                    "resource_type": "AWS::Lambda::Function",
+                },
+                {
+                    "resource": "arn:aws:lambda:eu-west-1:111122223333:function:fn",
+                    "resource_type": "AWS::Lambda::Function",
+                },
+            ]
+        }
+        self.assertEqual(_party_resource_summary(party), "fn (Lambda Function)")
+
+    def test_html_inventory_filters_by_classification(self):
+        import tempfile
+
+        from trustline import generate_html_report
+
+        grants = grants_from_policy_document(
+            {
+                "Statement": {
+                    "Effect": "Allow",
+                    "Principal": "*",
+                    "Action": "s3:GetObject",
+                }
+            },
+            resource="arn:aws:s3:::example-bucket",
+            resource_type="AWS::S3::Bucket",
+            mechanism="s3_bucket_policy",
+            trusted_accounts={},
+            account_to_vendor={},
+            current_account_id="111122223333",
+        )
+        coverage = {"scanned": [], "not_scanned": [], "backend": "policy_scanner"}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = generate_html_report(
+                grants,
+                coverage,
+                account_aliases={"111122223333": "example"},
+                output_dir=tmp,
+            )
+            with open(path, encoding="utf-8") as fh:
+                html = fh.read()
+        self.assertIn('id="inventory-table"', html)
+        self.assertIn('id="class-filter"', html)
+        self.assertIn('data-class="public"', html)
+        self.assertIn('data-filter="public"', html)
+        self.assertIn("kpi-filter", html)
 
 
 if __name__ == "__main__":

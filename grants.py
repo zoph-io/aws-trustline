@@ -124,6 +124,8 @@ MECHANISM_LABELS: dict[str, str] = {
     "sqs_queue_policy": "SQS queue policy",
     "lambda_resource_policy": "Lambda resource policy",
     "secretsmanager_resource_policy": "Secrets Manager resource policy",
+    "ecr_repository_policy": "ECR repository policy",
+    "lambda_layer_policy": "Lambda layer permission",
 }
 
 # Where a principal's display name came from. Reports print these labels.
@@ -515,10 +517,12 @@ _UUID_RE = re.compile(
 _RESOURCE_TYPES_NAME_IS_ENOUGH = frozenset({"IAM Role", "IAM User", "S3 Bucket"})
 
 
-def short_resource_name(arn_or_name: str) -> str:
+def short_resource_name(arn_or_name: str, resource_type: str = "") -> str:
     """Last path or ARN segment — too lossy alone for UUIDs and SNS names like ``1``."""
     if not arn_or_name:
         return ""
+    if resource_type == "AWS::Lambda::LayerVersion" and ":layer:" in arn_or_name:
+        return arn_or_name.split(":layer:", 1)[-1]
     if "/" in arn_or_name:
         return arn_or_name.split("/")[-1]
     if ":" in arn_or_name:
@@ -550,7 +554,7 @@ def grant_resource_label(grant: dict[str, Any]) -> str:
     """Inventory label: resource name plus type when the name alone is unusable."""
     arn = grant.get("resource") or ""
     rtype = compact_aws_resource_type(grant.get("resource_type") or "")
-    name = short_resource_name(arn)
+    name = short_resource_name(arn, grant.get("resource_type") or "")
     if not name:
         return rtype or "—"
     needs_type = rtype and (
@@ -1207,9 +1211,9 @@ def build_coverage(
         not_scanned.insert(
             0,
             {
-                "surface": "KMS cryptographic grants (ListGrants), S3 ACLs, ECR/EFS/RDS snapshots",
+                "surface": "KMS cryptographic grants (ListGrants), S3 ACLs, EFS/RDS snapshots",
                 "detail": (
-                    "Key/topic/queue/function/secret policies are scanned. "
+                    "Key/topic/queue/function/layer/secret/ECR policies are scanned. "
                     "KMS grants and remaining AA types need Access Analyzer."
                 ),
             },

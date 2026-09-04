@@ -4,15 +4,19 @@
 """
 AWS Trustline - Map and audit third-party trust relationships in your AWS account.
 
-Analyzes IAM Role trust policies and S3 bucket policies to identify third-party
-vendors with access to your resources. Compares AWS account IDs found in these
-policies against a reference list of known AWS accounts from fwd:cloudsec to
-identify the vendors behind these accounts.
+Expands sharing records into grant rows, groups them by external principal,
+and resolves 12-digit account IDs against fwd:cloudsec known vendor accounts.
+If an Access Analyzer exists it is used by default (effective access); otherwise
+IAM trusts and S3 bucket policies are walked. RAM, AMI, SSM, and credentials
+always run unless skipped.
 
 Usage:
     python trustline.py
     python trustline.py --profile my-profile --region us-east-1
-    python trustline.py --skip-s3 --output /tmp/reports
+    python trustline.py --all-regions --format both
+    python trustline.py --policy-scanner
+    python trustline.py --use-access-analyzer --wait-for-analyzer
+    python trustline.py --format csv
 """
 
 from __future__ import annotations
@@ -21,11 +25,12 @@ import argparse
 import html
 import json
 import os
-import re
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Any
+from urllib.parse import unquote
 
 import boto3
 import requests
@@ -37,14 +42,51 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-__version__ = "0.2.0"
+from grants import (
+    MECHANISM_LABELS,
+    SERVICE_SPECIFIC_CREDENTIAL_SERVICES,
+    actions_from_ram_permission,
+    apply_live_trust_conditions,
+    apply_s3_effective_public,
+    aws_console_url,
+    build_coverage,
+    choose_external_analyzer,
+    classification_reason,
+    clear_unproven_aa_condition_flags,
+    condition_summary,
+    dedupe_access_analyzer_grants,
+    empty_grant,
+    flatten_condition_keys,
+    grant_from_parsed_principal,
+    grant_resource_label,
+    grants_from_policy_document,
+    index_known_accounts,
+    inventory_csv,
+    is_aws_service_principal,
+    leftover_flags,
+    loads_policy_document,
+    merge_builtin_vendors,
+    oidc_condition_gaps,
+    parse_principal_value,
+    parties_from_grants,
+    party_details_markdown,
+    party_fixes,
+    party_totals,
+    report_scope_label,
+    role_name_from_resource,
+    should_flag_missing_external_id,
+    totals_from_grants,
+)
+
+__version__ = "0.5.0"
 
 REFERENCE_DATA_URL = (
     "https://raw.githubusercontent.com/fwdcloudsec/known_aws_accounts/main/accounts.yaml"
 )
 DEFAULT_TRUSTED_ACCOUNTS_FILE = "trusted_accounts.yaml"
 DEFAULT_OUTPUT_DIR = "reports"
-ACCOUNT_ID_PATTERN = re.compile(r"^\d{12}$")
+DEFAULT_WAIT_TIMEOUT = 300
+CACHE_DIR_ENV = "TRUSTLINE_CACHE_DIR"
 
 # External-access analyzer types (excludes unused-access and internal-access).
 EXTERNAL_ANALYZER_TYPES = {"ACCOUNT", "ORGANIZATION"}
@@ -61,54 +103,53 @@ AA_CLIENT_CONFIG = Config(
 # Cap on concurrent per-region API calls.
 AA_MAX_WORKERS = 8
 
-# Human-readable labels for the AWS resource types that IAM Access Analyzer
-# reports for external access. Keys match the `resourceType` field returned by
-# `accessanalyzer:ListFindings`.
-AA_RESOURCE_TYPE_LABELS: dict[str, str] = {
-    "AWS::S3::Bucket": "S3 Buckets",
-    "AWS::S3Express::DirectoryBucket": "S3 Directory Buckets",
-    "AWS::IAM::Role": "IAM Roles",
-    "AWS::IAM::User": "IAM Users",
-    "AWS::KMS::Key": "KMS Keys",
-    "AWS::Lambda::Function": "Lambda Functions",
-    "AWS::Lambda::LayerVersion": "Lambda Layers",
-    "AWS::SQS::Queue": "SQS Queues",
-    "AWS::SNS::Topic": "SNS Topics",
-    "AWS::SecretsManager::Secret": "Secrets Manager Secrets",
-    "AWS::EFS::FileSystem": "EFS File Systems",
-    "AWS::EC2::Snapshot": "EBS Snapshots",
-    "AWS::ECR::Repository": "ECR Repositories",
-    "AWS::RDS::DBSnapshot": "RDS DB Snapshots",
-    "AWS::RDS::DBClusterSnapshot": "RDS Cluster Snapshots",
-    "AWS::DynamoDB::Table": "DynamoDB Tables",
-    "AWS::DynamoDB::Stream": "DynamoDB Streams",
-}
-
 console = Console()
 
 
+def _known_accounts_cache_path() -> str:
+    base = os.environ.get(CACHE_DIR_ENV) or os.path.join(
+        os.path.expanduser("~"), ".cache", "aws-trustline"
+    )
+    return os.path.join(base, "known_aws_accounts.yaml")
+
+
+def _write_known_accounts_cache(path: str, body: str) -> None:
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    tmp = f"{path}.tmp"
+    with open(tmp, "w") as fh:
+        fh.write(body)
+    os.replace(tmp, path)
+
+
 def fetch_reference_data() -> dict[str, dict[str, Any]]:
-    """Fetch the reference data of known AWS accounts from fwd:cloudsec on GitHub."""
+    """Fetch known AWS accounts from fwd:cloudsec; fall back to a local cache."""
+    cache_path = _known_accounts_cache_path()
     try:
         response = requests.get(REFERENCE_DATA_URL, timeout=15)
         response.raise_for_status()
-
-        vendors_data = yaml.safe_load(response.text)
-
-        account_to_vendor: dict[str, dict[str, Any]] = {}
-        for vendor in vendors_data:
-            for account_id in vendor.get("accounts", []):
-                account_to_vendor[account_id] = {
-                    "name": vendor.get("name", "Unknown"),
-                    "type": vendor.get("type", "third-party"),
-                    "source": vendor.get("source", []),
-                }
-
-        return account_to_vendor
-
+        indexed = index_known_accounts(yaml.safe_load(response.text))
+        try:
+            _write_known_accounts_cache(cache_path, response.text)
+        except OSError as e:
+            console.print(f"[yellow]Could not write known-accounts cache: {e}[/yellow]")
+        return merge_builtin_vendors(indexed)
     except Exception as e:
-        console.print(f"[bold red]Error fetching reference data: {e}[/bold red]")
-        return {}
+        console.print(f"[bold yellow]Could not fetch known AWS accounts: {e}[/bold yellow]")
+        try:
+            with open(cache_path, "r") as fh:
+                cached = fh.read()
+            indexed = index_known_accounts(yaml.safe_load(cached))
+            console.print(
+                f"[green]Using cached known AWS accounts from {cache_path}[/green]"
+            )
+            return merge_builtin_vendors(indexed)
+        except OSError:
+            console.print(
+                "[yellow]No local cache; resolving names from builtin aliases only.[/yellow]"
+            )
+            return merge_builtin_vendors({})
 
 
 def fetch_org_accounts(session: boto3.Session) -> tuple[dict[str, dict[str, Any]], str | None]:
@@ -142,6 +183,18 @@ def fetch_org_accounts(session: boto3.Session) -> tuple[dict[str, dict[str, Any]
         return {}, error_msg
 
 
+def fetch_organization_id(session: boto3.Session) -> str | None:
+    """Return this account's Organizations ID (o-xxxx), or None."""
+    try:
+        org = session.client("organizations").describe_organization()
+        org_id = org.get("Organization", {}).get("Id")
+        if org_id:
+            console.print(f"[green]AWS Organization ID: {org_id}[/green]")
+        return org_id
+    except Exception:
+        return None
+
+
 def fetch_trusted_accounts(
     session: boto3.Session,
     trusted_accounts_file: str = DEFAULT_TRUSTED_ACCOUNTS_FILE,
@@ -164,19 +217,33 @@ def fetch_trusted_accounts(
 
         yaml_count = 0
         for entity in trusted_data:
-            for account_id in entity.get("accounts", []):
-                if account_id not in trusted_accounts:
-                    trusted_accounts[account_id] = {
-                        "name": entity.get("name", "Internal"),
-                        "type": "trusted",
-                        "description": entity.get("description", ""),
-                        "source": "yaml_file",
-                    }
-                    yaml_count += 1
+            if not isinstance(entity, dict):
+                continue
+            for raw_id in entity.get("accounts", []):
+                account_id = str(raw_id).strip()
+                if len(account_id) != 12 or not account_id.isdigit():
+                    continue
+                trusted_accounts[account_id] = {
+                    "name": entity.get("name", "Internal"),
+                    "type": "trusted",
+                    "description": entity.get("description", ""),
+                    "source": "yaml_file",
+                }
+                yaml_count += 1
 
         console.print(
-            f"[green]Loaded {yaml_count} additional trusted AWS accounts from YAML file[/green]"
+            f"[green]Loaded {yaml_count} trusted AWS accounts from YAML file[/green]"
         )
+        if org_error and yaml_count:
+            org_error = (
+                f"{org_error} Using trusted_accounts.yaml instead "
+                f"({yaml_count} account(s))."
+            )
+        elif org_error and yaml_count == 0:
+            console.print(
+                "[yellow]Member accounts cannot list Organizations. "
+                "Copy trusted_accounts.yaml.sample to trusted_accounts.yaml.[/yellow]"
+            )
         return trusted_accounts, org_error
 
     except Exception as e:
@@ -213,209 +280,104 @@ def get_account_aliases(session: boto3.Session) -> dict[str, str]:
         return {}
 
 
-def _extract_account_id_from_value(value: str) -> str | None:
-    """Extract a 12-digit AWS account ID from an ARN or raw string."""
-    if "arn:aws" in value:
-        parts = value.split(":")
-        if len(parts) >= 5 and ACCOUNT_ID_PATTERN.match(parts[4]):
-            return parts[4]
-    elif ACCOUNT_ID_PATTERN.match(value):
-        return value
-    return None
+def _owner_label(
+    account_id: str,
+    account_aliases: dict[str, str],
+    org_accounts: dict[str, dict[str, Any]],
+) -> str:
+    if not account_id:
+        return ""
+    if account_id in org_accounts:
+        return f"{account_id} ({org_accounts[account_id]['name']})"
+    if account_id in account_aliases:
+        return f"{account_id} ({account_aliases[account_id]})"
+    return account_id
 
 
-def extract_account_ids_from_policy(policy_document: dict[str, Any]) -> list[str]:
-    """Extract unique AWS account IDs from a policy document."""
-    account_ids: set[str] = set()
-
-    def search_for_accounts(node: Any) -> None:
-        if isinstance(node, dict):
-            for key, value in node.items():
-                if key == "AWS":
-                    principals = value if isinstance(value, list) else [value]
-                    for item in principals:
-                        if isinstance(item, str):
-                            acct = _extract_account_id_from_value(item)
-                            if acct:
-                                account_ids.add(acct)
-                else:
-                    search_for_accounts(value)
-        elif isinstance(node, list):
-            for item in node:
-                search_for_accounts(item)
-
-    search_for_accounts(policy_document)
-    return list(account_ids)
-
-
-def check_external_id_condition(policy_document: dict[str, Any]) -> bool:
-    """
-    Check if ALL cross-account Allow statements in a trust policy have an
-    ExternalId condition to prevent the confused deputy problem.
-
-    Returns True only if every cross-account statement includes an ExternalId
-    condition. Returns False if any cross-account statement is missing one, or
-    if no cross-account statements are found.
-    """
-    if not policy_document or "Statement" not in policy_document:
-        return False
-
-    statements = policy_document["Statement"]
-    if not isinstance(statements, list):
-        statements = [statements]
-
-    found_cross_account = False
-
-    for statement in statements:
-        if statement.get("Effect") != "Allow":
-            continue
-
-        principal = statement.get("Principal", {})
-        if not isinstance(principal, dict):
-            continue
-
-        aws_principal = principal.get("AWS", "")
-        if not aws_principal:
-            continue
-
-        found_cross_account = True
-
-        condition = statement.get("Condition", {})
-        if not condition:
-            return False
-
-        has_external_id = False
-        for condition_type, condition_values in condition.items():
-            if condition_type in ("StringEquals", "StringLike", "ArnLike"):
-                if "sts:ExternalId" in condition_values:
-                    has_external_id = True
-                    break
-
-        if not has_external_id:
-            return False
-
-    return found_cross_account
-
-
-def check_iam_role_trust_policies(
-    session: boto3.Session,
+def grant_collect_context(
+    *,
     account_to_vendor: dict[str, dict[str, Any]],
     trusted_accounts: dict[str, dict[str, Any]],
+    current_account_id: str,
+    our_organization_id: str | None,
     account_aliases: dict[str, str],
-) -> tuple[dict, dict, dict, dict]:
-    """Check IAM Role trust policies for external access."""
+    org_accounts: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "account_to_vendor": account_to_vendor,
+        "trusted_accounts": trusted_accounts,
+        "current_account_id": current_account_id,
+        "our_organization_id": our_organization_id,
+        "owner_account": current_account_id,
+        "owner_label": _owner_label(current_account_id, account_aliases, org_accounts),
+    }
+
+
+def collect_iam_role_grants(
+    session: boto3.Session,
+    **kwargs: Any,
+) -> list[dict[str, Any]]:
+    """Expand IAM role trust policies into grant rows."""
     console.print("[bold blue]Checking IAM role trust policies...[/bold blue]")
-
-    iam_client = session.client("iam")
-    known_vendors: dict[str, list[str]] = {}
-    unknown_accounts: dict[str, list[str]] = {}
-    trusted_entities: dict[str, dict[str, Any]] = {}
-    vulnerable_roles: dict[str, dict[str, Any]] = {}
-
+    grants: list[dict[str, Any]] = []
     try:
+        iam_client = session.client("iam")
         paginator = iam_client.get_paginator("list_roles")
         for page in paginator.paginate():
             for role in page["Roles"]:
                 role_name = role["RoleName"]
-                trust_policy = role.get("AssumeRolePolicyDocument", {})
-                account_ids = extract_account_ids_from_policy(trust_policy)
-
-                for account_id in account_ids:
-                    if account_id == "":
-                        continue
-
-                    if account_id in trusted_accounts:
-                        trusted_name = trusted_accounts[account_id]["name"]
-                        source = trusted_accounts[account_id]["source"]
-                        if trusted_name not in trusted_entities:
-                            trusted_entities[trusted_name] = {"roles": [], "source": source}
-                        trusted_entities[trusted_name]["roles"].append(role_name)
-
-                        if not check_external_id_condition(trust_policy):
-                            if trusted_name not in vulnerable_roles:
-                                vulnerable_roles[trusted_name] = {"roles": [], "source": source}
-                            vulnerable_roles[trusted_name]["roles"].append(role_name)
-
-                    elif account_id in account_to_vendor:
-                        vendor_name = account_to_vendor[account_id]["name"]
-                        if vendor_name not in known_vendors:
-                            known_vendors[vendor_name] = []
-                        known_vendors[vendor_name].append(role_name)
-
-                        if not check_external_id_condition(trust_policy):
-                            if vendor_name not in vulnerable_roles:
-                                vulnerable_roles[vendor_name] = {"roles": [], "source": "vendor"}
-                            vulnerable_roles[vendor_name]["roles"].append(role_name)
-
-                    else:
-                        display_id = account_id
-                        if account_id in account_aliases:
-                            display_id = f"{account_id} ({account_aliases[account_id]})"
-
-                        if display_id not in unknown_accounts:
-                            unknown_accounts[display_id] = []
-                        unknown_accounts[display_id].append(role_name)
-
-                        if not check_external_id_condition(trust_policy):
-                            if display_id not in vulnerable_roles:
-                                vulnerable_roles[display_id] = {"roles": [], "source": "unknown"}
-                            vulnerable_roles[display_id]["roles"].append(role_name)
-
-        return known_vendors, unknown_accounts, trusted_entities, vulnerable_roles
-
+                role_arn = role.get("Arn") or role_name
+                grants.extend(
+                    grants_from_policy_document(
+                        role.get("AssumeRolePolicyDocument") or {},
+                        resource=role_arn,
+                        resource_type="AWS::IAM::Role",
+                        mechanism="trust_policy",
+                        region="global",
+                        default_actions=["sts:AssumeRole"],
+                        trusted_accounts=kwargs["trusted_accounts"],
+                        account_to_vendor=kwargs["account_to_vendor"],
+                        current_account_id=kwargs["current_account_id"],
+                        owner_account=kwargs["owner_account"],
+                        owner_label=kwargs["owner_label"],
+                        our_organization_id=kwargs["our_organization_id"],
+                    )
+                )
+        console.print(f"[green]IAM role grants: {len(grants)}[/green]")
     except Exception as e:
-        console.print(
-            f"[bold red]Error checking IAM role trust policies: {e}[/bold red]"
-        )
-        return {}, {}, {}, {}
+        console.print(f"[bold red]Error checking IAM role trust policies: {e}[/bold red]")
+    return grants
 
 
-def check_s3_bucket_policies(
-    session: boto3.Session,
-    account_to_vendor: dict[str, dict[str, Any]],
-    trusted_accounts: dict[str, dict[str, Any]],
-    account_aliases: dict[str, str],
-) -> tuple[dict, dict, dict]:
-    """Check S3 bucket policies for external access."""
-    console.print("[bold blue]Checking S3 bucket policies...[/bold blue]")
-
-    s3_client = session.client("s3")
-    known_vendors: dict[str, list[str]] = {}
-    unknown_accounts: dict[str, list[str]] = {}
-    trusted_entities: dict[str, dict[str, Any]] = {}
-
+def _bucket_is_effectively_public(s3_client: Any, bucket_name: str) -> bool | None:
+    """GetBucketPolicyStatus.IsPublic, or None if the call fails."""
     try:
-        response = s3_client.list_buckets()
-        for bucket in response["Buckets"]:
-            bucket_name = bucket["Name"]
+        status = s3_client.get_bucket_policy_status(Bucket=bucket_name)
+        return bool((status.get("PolicyStatus") or {}).get("IsPublic"))
+    except ClientError:
+        return None
+    except (BotoCoreError, Exception):
+        return None
 
+
+def collect_s3_bucket_grants(
+    session: boto3.Session,
+    **kwargs: Any,
+) -> list[dict[str, Any]]:
+    """Expand S3 bucket policies into grant rows.
+
+    Public ``Principal: "*"`` rows are checked with GetBucketPolicyStatus so
+    Block Public Access is not reported as current public access.
+    """
+    console.print("[bold blue]Checking S3 bucket policies...[/bold blue]")
+    grants: list[dict[str, Any]] = []
+    try:
+        s3_client = session.client("s3")
+        for bucket in s3_client.list_buckets().get("Buckets", []):
+            bucket_name = bucket["Name"]
             try:
                 policy_response = s3_client.get_bucket_policy(Bucket=bucket_name)
                 policy_document = json.loads(policy_response["Policy"])
-                account_ids = extract_account_ids_from_policy(policy_document)
-
-                for account_id in account_ids:
-                    if account_id in trusted_accounts:
-                        trusted_name = trusted_accounts[account_id]["name"]
-                        source = trusted_accounts[account_id]["source"]
-                        if trusted_name not in trusted_entities:
-                            trusted_entities[trusted_name] = {"buckets": [], "source": source}
-                        trusted_entities[trusted_name]["buckets"].append(bucket_name)
-
-                    elif account_id in account_to_vendor:
-                        vendor_name = account_to_vendor[account_id]["name"]
-                        if vendor_name not in known_vendors:
-                            known_vendors[vendor_name] = []
-                        known_vendors[vendor_name].append(bucket_name)
-
-                    else:
-                        display_id = account_id
-                        if account_id in account_aliases:
-                            display_id = f"{account_id} ({account_aliases[account_id]})"
-                        if display_id not in unknown_accounts:
-                            unknown_accounts[display_id] = []
-                        unknown_accounts[display_id].append(bucket_name)
-
             except ClientError as e:
                 if e.response["Error"]["Code"] == "NoSuchBucketPolicy":
                     continue
@@ -423,248 +385,1672 @@ def check_s3_bucket_policies(
                     f"[yellow]Warning: Could not check policy for bucket {bucket_name}: "
                     f"{e.response['Error']['Message']}[/yellow]"
                 )
+                continue
+            bucket_grants = grants_from_policy_document(
+                policy_document,
+                resource=bucket_name,
+                resource_type="AWS::S3::Bucket",
+                mechanism="s3_bucket_policy",
+                region="global",
+                trusted_accounts=kwargs["trusted_accounts"],
+                account_to_vendor=kwargs["account_to_vendor"],
+                current_account_id=kwargs["current_account_id"],
+                owner_account=kwargs["owner_account"],
+                owner_label=kwargs["owner_label"],
+                our_organization_id=kwargs["our_organization_id"],
+            )
+            if any(g.get("is_public") for g in bucket_grants):
+                effectively_public = _bucket_is_effectively_public(s3_client, bucket_name)
+                if effectively_public is None:
+                    console.print(
+                        f"[yellow]Warning: GetBucketPolicyStatus failed for "
+                        f"{bucket_name}; treating Allow * as currently public[/yellow]"
+                    )
+                for grant in bucket_grants:
+                    apply_s3_effective_public(grant, effectively_public)
+            grants.extend(bucket_grants)
+        console.print(f"[green]S3 bucket policy grants: {len(grants)}[/green]")
+    except Exception as e:
+        console.print(f"[bold red]Error checking S3 bucket policies: {e}[/bold red]")
+    return grants
 
-        return known_vendors, unknown_accounts, trusted_entities
 
+def _client_error_code(error: ClientError) -> str:
+    return str((error.response.get("Error") or {}).get("Code") or "")
+
+
+def _grants_from_resource_policy(
+    policy_document: dict[str, Any] | None,
+    *,
+    resource: str,
+    resource_type: str,
+    mechanism: str,
+    region: str,
+    kwargs: dict[str, Any],
+) -> list[dict[str, Any]]:
+    if not policy_document:
+        return []
+    return grants_from_policy_document(
+        policy_document,
+        resource=resource,
+        resource_type=resource_type,
+        mechanism=mechanism,
+        region=region,
+        trusted_accounts=kwargs["trusted_accounts"],
+        account_to_vendor=kwargs["account_to_vendor"],
+        current_account_id=kwargs["current_account_id"],
+        owner_account=kwargs["owner_account"],
+        owner_label=kwargs["owner_label"],
+        our_organization_id=kwargs["our_organization_id"],
+    )
+
+
+def _grant_from_principal_string(
+    value: str,
+    *,
+    resource: str,
+    resource_type: str,
+    mechanism: str,
+    region: str,
+    kwargs: dict[str, Any],
+    actions: list[str] | None = None,
+) -> dict[str, Any] | None:
+    if not value or is_aws_service_principal(value):
+        return None
+    parsed = parse_principal_value(
+        "AWS", value, our_organization_id=kwargs.get("our_organization_id")
+    )
+    return grant_from_parsed_principal(
+        parsed,
+        statement=None,
+        resource=resource,
+        resource_type=resource_type,
+        mechanism=mechanism,
+        trusted_accounts=kwargs["trusted_accounts"],
+        account_to_vendor=kwargs["account_to_vendor"],
+        current_account_id=kwargs["current_account_id"],
+        region=region,
+        owner_account=kwargs["owner_account"],
+        owner_label=kwargs["owner_label"],
+        actions=actions,
+        our_organization_id=kwargs.get("our_organization_id"),
+    )
+
+
+def _collect_kms_in_region(
+    session: boto3.Session, region: str, kwargs: dict[str, Any]
+) -> tuple[str, list[dict[str, Any]], str | None]:
+    grants: list[dict[str, Any]] = []
+    try:
+        client = session.client("kms", region_name=region, config=AA_CLIENT_CONFIG)
+        paginator = client.get_paginator("list_keys")
+        for page in paginator.paginate():
+            for key in page.get("Keys") or []:
+                key_id = key.get("KeyId") or ""
+                try:
+                    meta = client.describe_key(KeyId=key_id).get("KeyMetadata") or {}
+                    if meta.get("KeyManager") == "AWS":
+                        continue
+                    if meta.get("KeyState") not in ("Enabled", "Disabled"):
+                        continue
+                    arn = meta.get("Arn") or key.get("KeyArn") or key_id
+                    raw = client.get_key_policy(KeyId=key_id, PolicyName="default").get("Policy")
+                    grants.extend(
+                        _grants_from_resource_policy(
+                            loads_policy_document(raw),
+                            resource=arn,
+                            resource_type="AWS::KMS::Key",
+                            mechanism="kms_key_policy",
+                            region=region,
+                            kwargs=kwargs,
+                        )
+                    )
+                    try:
+                        grant_pages = client.get_paginator("list_grants")
+                        for gpage in grant_pages.paginate(KeyId=key_id):
+                            for entry in gpage.get("Grants") or []:
+                                if entry.get("GranteeServicePrincipal"):
+                                    continue
+                                row = _grant_from_principal_string(
+                                    (entry.get("GranteePrincipal") or "").strip(),
+                                    resource=arn,
+                                    resource_type="AWS::KMS::Key",
+                                    mechanism="kms_grant",
+                                    region=region,
+                                    kwargs=kwargs,
+                                    actions=[
+                                        op
+                                        for op in (entry.get("Operations") or [])
+                                        if isinstance(op, str)
+                                    ],
+                                )
+                                if row:
+                                    grants.append(row)
+                    except ClientError:
+                        pass
+                except ClientError:
+                    continue
+        return region, grants, None
+    except ClientError as e:
+        return region, [], e.response["Error"]["Message"]
+    except (BotoCoreError, Exception) as e:
+        return region, [], str(e)
+
+
+def _collect_sns_in_region(
+    session: boto3.Session, region: str, kwargs: dict[str, Any]
+) -> tuple[str, list[dict[str, Any]], str | None]:
+    grants: list[dict[str, Any]] = []
+    try:
+        client = session.client("sns", region_name=region, config=AA_CLIENT_CONFIG)
+        paginator = client.get_paginator("list_topics")
+        for page in paginator.paginate():
+            for topic in page.get("Topics") or []:
+                arn = topic.get("TopicArn") or ""
+                if not arn:
+                    continue
+                try:
+                    attrs = client.get_topic_attributes(TopicArn=arn).get("Attributes") or {}
+                    grants.extend(
+                        _grants_from_resource_policy(
+                            loads_policy_document(attrs.get("Policy")),
+                            resource=arn,
+                            resource_type="AWS::SNS::Topic",
+                            mechanism="sns_topic_policy",
+                            region=region,
+                            kwargs=kwargs,
+                        )
+                    )
+                except ClientError:
+                    continue
+        return region, grants, None
+    except ClientError as e:
+        return region, [], e.response["Error"]["Message"]
+    except (BotoCoreError, Exception) as e:
+        return region, [], str(e)
+
+
+def _collect_sqs_in_region(
+    session: boto3.Session, region: str, kwargs: dict[str, Any]
+) -> tuple[str, list[dict[str, Any]], str | None]:
+    grants: list[dict[str, Any]] = []
+    try:
+        client = session.client("sqs", region_name=region, config=AA_CLIENT_CONFIG)
+        paginator = client.get_paginator("list_queues")
+        for page in paginator.paginate():
+            for url in page.get("QueueUrls") or []:
+                try:
+                    attrs = (
+                        client.get_queue_attributes(
+                            QueueUrl=url, AttributeNames=["Policy", "QueueArn"]
+                        ).get("Attributes")
+                        or {}
+                    )
+                    arn = attrs.get("QueueArn") or url
+                    grants.extend(
+                        _grants_from_resource_policy(
+                            loads_policy_document(attrs.get("Policy")),
+                            resource=arn,
+                            resource_type="AWS::SQS::Queue",
+                            mechanism="sqs_queue_policy",
+                            region=region,
+                            kwargs=kwargs,
+                        )
+                    )
+                except ClientError:
+                    continue
+        return region, grants, None
+    except ClientError as e:
+        return region, [], e.response["Error"]["Message"]
+    except (BotoCoreError, Exception) as e:
+        return region, [], str(e)
+
+
+def _collect_lambda_in_region(
+    session: boto3.Session, region: str, kwargs: dict[str, Any]
+) -> tuple[str, list[dict[str, Any]], str | None]:
+    grants: list[dict[str, Any]] = []
+    try:
+        client = session.client("lambda", region_name=region, config=AA_CLIENT_CONFIG)
+        paginator = client.get_paginator("list_functions")
+        for page in paginator.paginate():
+            for fn in page.get("Functions") or []:
+                arn = fn.get("FunctionArn") or fn.get("FunctionName") or ""
+                name = fn.get("FunctionName") or ""
+                try:
+                    raw = client.get_policy(FunctionName=name).get("Policy")
+                except ClientError:
+                    continue
+                grants.extend(
+                    _grants_from_resource_policy(
+                        loads_policy_document(raw),
+                        resource=arn,
+                        resource_type="AWS::Lambda::Function",
+                        mechanism="lambda_resource_policy",
+                        region=region,
+                        kwargs=kwargs,
+                    )
+                )
+        return region, grants, None
+    except ClientError as e:
+        return region, [], e.response["Error"]["Message"]
+    except (BotoCoreError, Exception) as e:
+        return region, [], str(e)
+
+
+def _collect_secrets_in_region(
+    session: boto3.Session, region: str, kwargs: dict[str, Any]
+) -> tuple[str, list[dict[str, Any]], str | None]:
+    grants: list[dict[str, Any]] = []
+    try:
+        client = session.client(
+            "secretsmanager", region_name=region, config=AA_CLIENT_CONFIG
+        )
+        paginator = client.get_paginator("list_secrets")
+        for page in paginator.paginate():
+            for secret in page.get("SecretList") or []:
+                arn = secret.get("ARN") or secret.get("Name") or ""
+                name = secret.get("Name") or arn
+                try:
+                    raw = client.get_resource_policy(SecretId=name).get("ResourcePolicy")
+                except ClientError:
+                    continue
+                grants.extend(
+                    _grants_from_resource_policy(
+                        loads_policy_document(raw),
+                        resource=arn,
+                        resource_type="AWS::SecretsManager::Secret",
+                        mechanism="secretsmanager_resource_policy",
+                        region=region,
+                        kwargs=kwargs,
+                    )
+                )
+        return region, grants, None
+    except ClientError as e:
+        return region, [], e.response["Error"]["Message"]
+    except (BotoCoreError, Exception) as e:
+        return region, [], str(e)
+
+
+def _collect_lambda_layers_in_region(
+    session: boto3.Session, region: str, kwargs: dict[str, Any]
+) -> tuple[str, list[dict[str, Any]], str | None]:
+    grants: list[dict[str, Any]] = []
+    try:
+        client = session.client("lambda", region_name=region, config=AA_CLIENT_CONFIG)
+        paginator = client.get_paginator("list_layers")
+        for page in paginator.paginate():
+            for layer in page.get("Layers") or []:
+                name = layer.get("LayerName") or ""
+                try:
+                    versions = (
+                        client.list_layer_versions(LayerName=name).get("LayerVersions")
+                        or []
+                    )
+                except ClientError:
+                    continue
+                # Newest first. Older versions with leftover policies still
+                # grant access; cap so accounts with hundreds of versions stay
+                # scannable.
+                for version in versions[:25]:
+                    ver = version.get("Version")
+                    arn = version.get("LayerVersionArn") or f"{name}:{ver}"
+                    try:
+                        raw = client.get_layer_version_policy(
+                            LayerName=name, VersionNumber=ver
+                        ).get("Policy")
+                    except ClientError:
+                        continue
+                    grants.extend(
+                        _grants_from_resource_policy(
+                            loads_policy_document(raw),
+                            resource=arn,
+                            resource_type="AWS::Lambda::LayerVersion",
+                            mechanism="lambda_layer_policy",
+                            region=region,
+                            kwargs=kwargs,
+                        )
+                    )
+        return region, grants, None
+    except ClientError as e:
+        return region, [], e.response["Error"]["Message"]
+    except (BotoCoreError, Exception) as e:
+        return region, [], str(e)
+
+
+def _collect_ecr_in_region(
+    session: boto3.Session, region: str, kwargs: dict[str, Any]
+) -> tuple[str, list[dict[str, Any]], str | None]:
+    grants: list[dict[str, Any]] = []
+    try:
+        client = session.client("ecr", region_name=region, config=AA_CLIENT_CONFIG)
+        paginator = client.get_paginator("describe_repositories")
+        for page in paginator.paginate():
+            for repo in page.get("repositories") or []:
+                name = repo.get("repositoryName") or ""
+                arn = repo.get("repositoryArn") or name
+                try:
+                    raw = client.get_repository_policy(repositoryName=name).get("policyText")
+                except ClientError:
+                    continue
+                grants.extend(
+                    _grants_from_resource_policy(
+                        loads_policy_document(raw),
+                        resource=arn,
+                        resource_type="AWS::ECR::Repository",
+                        mechanism="ecr_repository_policy",
+                        region=region,
+                        kwargs=kwargs,
+                    )
+                )
+        return region, grants, None
+    except ClientError as e:
+        return region, [], e.response["Error"]["Message"]
+    except (BotoCoreError, Exception) as e:
+        return region, [], str(e)
+
+
+def _collect_eventbridge_in_region(
+    session: boto3.Session, region: str, kwargs: dict[str, Any]
+) -> tuple[str, list[dict[str, Any]], str | None]:
+    grants: list[dict[str, Any]] = []
+    try:
+        client = session.client("events", region_name=region, config=AA_CLIENT_CONFIG)
+        buses: list[dict[str, Any]] = []
+        token: str | None = None
+        while True:
+            kwargs_api: dict[str, Any] = {}
+            if token:
+                kwargs_api["NextToken"] = token
+            resp = client.list_event_buses(**kwargs_api)
+            buses.extend(resp.get("EventBuses") or [])
+            token = resp.get("NextToken")
+            if not token:
+                break
+        for bus in buses:
+            name = bus.get("Name") or "default"
+            arn = bus.get("Arn") or name
+            try:
+                detail = client.describe_event_bus(Name=name)
+            except ClientError:
+                continue
+            grants.extend(
+                _grants_from_resource_policy(
+                    loads_policy_document(detail.get("Policy")),
+                    resource=arn,
+                    resource_type="AWS::Events::EventBus",
+                    mechanism="eventbridge_bus_policy",
+                    region=region,
+                    kwargs=kwargs,
+                )
+            )
+        return region, grants, None
+    except ClientError as e:
+        return region, [], e.response["Error"]["Message"]
+    except (BotoCoreError, Exception) as e:
+        return region, [], str(e)
+
+
+def _collect_glue_in_region(
+    session: boto3.Session, region: str, kwargs: dict[str, Any]
+) -> tuple[str, list[dict[str, Any]], str | None]:
+    grants: list[dict[str, Any]] = []
+    try:
+        client = session.client("glue", region_name=region, config=AA_CLIENT_CONFIG)
+        try:
+            raw = client.get_resource_policy().get("PolicyInJson")
+        except ClientError as e:
+            code = (e.response.get("Error") or {}).get("Code") or ""
+            if code in ("EntityNotFoundException", "EntityNotFound"):
+                return region, [], None
+            return region, [], e.response["Error"]["Message"]
+        account = kwargs.get("current_account_id") or ""
+        arn = f"arn:aws:glue:{region}:{account}:catalog"
+        grants.extend(
+            _grants_from_resource_policy(
+                loads_policy_document(raw),
+                resource=arn,
+                resource_type="AWS::Glue::DataCatalog",
+                mechanism="glue_catalog_policy",
+                region=region,
+                kwargs=kwargs,
+            )
+        )
+        return region, grants, None
+    except ClientError as e:
+        return region, [], e.response["Error"]["Message"]
+    except (BotoCoreError, Exception) as e:
+        return region, [], str(e)
+
+
+def _collect_opensearch_in_region(
+    session: boto3.Session, region: str, kwargs: dict[str, Any]
+) -> tuple[str, list[dict[str, Any]], str | None]:
+    grants: list[dict[str, Any]] = []
+    try:
+        client = session.client("opensearch", region_name=region, config=AA_CLIENT_CONFIG)
+        names = client.list_domain_names().get("DomainNames") or []
+        for item in names:
+            name = item.get("DomainName") if isinstance(item, dict) else str(item or "")
+            if not name:
+                continue
+            try:
+                domain = client.describe_domain(DomainName=name).get("DomainStatus") or {}
+            except ClientError:
+                continue
+            arn = domain.get("ARN") or name
+            grants.extend(
+                _grants_from_resource_policy(
+                    loads_policy_document(domain.get("AccessPolicies")),
+                    resource=arn,
+                    resource_type="AWS::OpenSearchService::Domain",
+                    mechanism="opensearch_domain_policy",
+                    region=region,
+                    kwargs=kwargs,
+                )
+            )
+        return region, grants, None
+    except ClientError as e:
+        return region, [], e.response["Error"]["Message"]
+    except (BotoCoreError, Exception) as e:
+        return region, [], str(e)
+
+
+def _collect_efs_in_region(
+    session: boto3.Session, region: str, kwargs: dict[str, Any]
+) -> tuple[str, list[dict[str, Any]], str | None]:
+    grants: list[dict[str, Any]] = []
+    try:
+        client = session.client("efs", region_name=region, config=AA_CLIENT_CONFIG)
+        paginator = client.get_paginator("describe_file_systems")
+        for page in paginator.paginate():
+            for fs in page.get("FileSystems") or []:
+                fs_id = fs.get("FileSystemId") or ""
+                arn = fs.get("FileSystemArn") or fs_id
+                try:
+                    raw = client.describe_file_system_policy(FileSystemId=fs_id).get(
+                        "Policy"
+                    )
+                except ClientError as e:
+                    if _client_error_code(e) in ("PolicyNotFound", "FileSystemNotFound"):
+                        continue
+                    continue
+                grants.extend(
+                    _grants_from_resource_policy(
+                        loads_policy_document(raw),
+                        resource=arn,
+                        resource_type="AWS::EFS::FileSystem",
+                        mechanism="efs_file_system_policy",
+                        region=region,
+                        kwargs=kwargs,
+                    )
+                )
+        return region, grants, None
+    except ClientError as e:
+        return region, [], e.response["Error"]["Message"]
+    except (BotoCoreError, Exception) as e:
+        return region, [], str(e)
+
+
+def _dynamodb_policy_grants(
+    client: Any,
+    arn: str,
+    resource_type: str,
+    region: str,
+    kwargs: dict[str, Any],
+) -> list[dict[str, Any]]:
+    try:
+        raw = client.get_resource_policy(ResourceArn=arn).get("Policy")
+    except ClientError as e:
+        if _client_error_code(e) in (
+            "PolicyNotFoundException",
+            "ResourceNotFoundException",
+            "ResourceNotFound",
+        ):
+            return []
+        return []
+    return _grants_from_resource_policy(
+        loads_policy_document(raw),
+        resource=arn,
+        resource_type=resource_type,
+        mechanism="dynamodb_resource_policy",
+        region=region,
+        kwargs=kwargs,
+    )
+
+
+def _collect_dynamodb_in_region(
+    session: boto3.Session, region: str, kwargs: dict[str, Any]
+) -> tuple[str, list[dict[str, Any]], str | None]:
+    grants: list[dict[str, Any]] = []
+    try:
+        client = session.client("dynamodb", region_name=region, config=AA_CLIENT_CONFIG)
+        account = kwargs.get("current_account_id") or ""
+        tables: list[str] = []
+        for page in client.get_paginator("list_tables").paginate():
+            tables.extend(page.get("TableNames") or [])
+        for name in tables:
+            arn = f"arn:aws:dynamodb:{region}:{account}:table/{name}"
+            grants.extend(
+                _dynamodb_policy_grants(
+                    client, arn, "AWS::DynamoDB::Table", region, kwargs
+                )
+            )
+        try:
+            streams_client = session.client(
+                "dynamodbstreams", region_name=region, config=AA_CLIENT_CONFIG
+            )
+            stream_arns: list[str] = []
+            token: str | None = None
+            while True:
+                req: dict[str, Any] = {}
+                if token:
+                    req["ExclusiveStartStreamArn"] = token
+                resp = streams_client.list_streams(**req)
+                for item in resp.get("Streams") or []:
+                    arn = item.get("StreamArn") or ""
+                    if arn:
+                        stream_arns.append(arn)
+                token = resp.get("LastEvaluatedStreamArn")
+                if not token:
+                    break
+            for arn in stream_arns:
+                grants.extend(
+                    _dynamodb_policy_grants(
+                        client, arn, "AWS::DynamoDB::Stream", region, kwargs
+                    )
+                )
+        except ClientError:
+            pass
+        return region, grants, None
+    except ClientError as e:
+        return region, [], e.response["Error"]["Message"]
+    except (BotoCoreError, Exception) as e:
+        return region, [], str(e)
+
+
+def _ebs_snapshot_share_grants(
+    ec2: Any, snapshot: dict[str, Any], region: str, kwargs: dict[str, Any]
+) -> list[dict[str, Any]]:
+    snap_id = snapshot.get("SnapshotId") or ""
+    owner = snapshot.get("OwnerId") or kwargs.get("current_account_id") or ""
+    arn = f"arn:aws:ec2:{region}:{owner}:snapshot/{snap_id}" if owner else snap_id
+    try:
+        attr = ec2.describe_snapshot_attribute(
+            SnapshotId=snap_id, Attribute="createVolumePermission"
+        )
+    except ClientError:
+        return []
+    grants: list[dict[str, Any]] = []
+    for perm in attr.get("CreateVolumePermissions") or []:
+        if (perm.get("Group") or "").lower() == "all":
+            principal = "*"
+        elif perm.get("UserId"):
+            principal = perm["UserId"]
+        else:
+            continue
+        row = _grant_from_principal_string(
+            principal,
+            resource=arn,
+            resource_type="AWS::EC2::Snapshot",
+            mechanism="ebs_snapshot_share",
+            region=region,
+            kwargs=kwargs,
+            actions=["ec2:CreateVolume"],
+        )
+        if row:
+            grants.append(row)
+    return grants
+
+
+def _collect_ebs_snapshots_in_region(
+    session: boto3.Session, region: str, kwargs: dict[str, Any]
+) -> tuple[str, list[dict[str, Any]], str | None]:
+    grants: list[dict[str, Any]] = []
+    try:
+        ec2 = session.client("ec2", region_name=region, config=AA_CLIENT_CONFIG)
+        snapshots: list[dict[str, Any]] = []
+        pager = ec2.get_paginator("describe_snapshots")
+        for page in pager.paginate(OwnerIds=["self"]):
+            snapshots.extend(page.get("Snapshots") or [])
+        if not snapshots:
+            return region, [], None
+        workers = min(8, max(1, len(snapshots)))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [
+                pool.submit(_ebs_snapshot_share_grants, ec2, snap, region, kwargs)
+                for snap in snapshots
+            ]
+            for future in as_completed(futures):
+                grants.extend(future.result())
+        return region, grants, None
+    except ClientError as e:
+        return region, [], e.response["Error"]["Message"]
+    except (BotoCoreError, Exception) as e:
+        return region, [], str(e)
+
+
+def _rds_restore_attribute_grants(
+    *,
+    attributes: list[dict[str, Any]],
+    resource: str,
+    resource_type: str,
+    mechanism: str,
+    region: str,
+    kwargs: dict[str, Any],
+    actions: list[str],
+) -> list[dict[str, Any]]:
+    grants: list[dict[str, Any]] = []
+    for attr in attributes:
+        if (attr.get("AttributeName") or "").lower() != "restore":
+            continue
+        for value in attr.get("AttributeValues") or []:
+            if not isinstance(value, str) or not value:
+                continue
+            principal = "*" if value.lower() == "all" else value
+            row = _grant_from_principal_string(
+                principal,
+                resource=resource,
+                resource_type=resource_type,
+                mechanism=mechanism,
+                region=region,
+                kwargs=kwargs,
+                actions=actions,
+            )
+            if row:
+                grants.append(row)
+    return grants
+
+
+def _collect_rds_snapshots_in_region(
+    session: boto3.Session, region: str, kwargs: dict[str, Any]
+) -> tuple[str, list[dict[str, Any]], str | None]:
+    grants: list[dict[str, Any]] = []
+    try:
+        client = session.client("rds", region_name=region, config=AA_CLIENT_CONFIG)
+        snapshots: list[dict[str, Any]] = []
+        for page in client.get_paginator("describe_db_snapshots").paginate(
+            SnapshotType="manual"
+        ):
+            snapshots.extend(page.get("DBSnapshots") or [])
+        for snap in snapshots:
+            ident = snap.get("DBSnapshotIdentifier") or ""
+            arn = snap.get("DBSnapshotArn") or ident
+            try:
+                result = client.describe_db_snapshot_attributes(
+                    DBSnapshotIdentifier=ident
+                )
+            except ClientError:
+                continue
+            attrs = (
+                (result.get("DBSnapshotAttributesResult") or {}).get(
+                    "DBSnapshotAttributes"
+                )
+                or []
+            )
+            grants.extend(
+                _rds_restore_attribute_grants(
+                    attributes=attrs,
+                    resource=arn,
+                    resource_type="AWS::RDS::DBSnapshot",
+                    mechanism="rds_snapshot_share",
+                    region=region,
+                    kwargs=kwargs,
+                    actions=["rds:RestoreDBInstanceFromDBSnapshot"],
+                )
+            )
+        cluster_snaps: list[dict[str, Any]] = []
+        for page in client.get_paginator("describe_db_cluster_snapshots").paginate(
+            SnapshotType="manual"
+        ):
+            cluster_snaps.extend(page.get("DBClusterSnapshots") or [])
+        for snap in cluster_snaps:
+            ident = snap.get("DBClusterSnapshotIdentifier") or ""
+            arn = snap.get("DBClusterSnapshotArn") or ident
+            try:
+                result = client.describe_db_cluster_snapshot_attributes(
+                    DBClusterSnapshotIdentifier=ident
+                )
+            except ClientError:
+                continue
+            attrs = (
+                (result.get("DBClusterSnapshotAttributesResult") or {}).get(
+                    "DBClusterSnapshotAttributes"
+                )
+                or []
+            )
+            grants.extend(
+                _rds_restore_attribute_grants(
+                    attributes=attrs,
+                    resource=arn,
+                    resource_type="AWS::RDS::DBClusterSnapshot",
+                    mechanism="rds_cluster_snapshot_share",
+                    region=region,
+                    kwargs=kwargs,
+                    actions=["rds:RestoreDBClusterFromSnapshot"],
+                )
+            )
+        return region, grants, None
+    except ClientError as e:
+        return region, [], e.response["Error"]["Message"]
+    except (BotoCoreError, Exception) as e:
+        return region, [], str(e)
+
+
+def _collect_privatelink_in_region(
+    session: boto3.Session, region: str, kwargs: dict[str, Any]
+) -> tuple[str, list[dict[str, Any]], str | None]:
+    grants: list[dict[str, Any]] = []
+    try:
+        ec2 = session.client("ec2", region_name=region, config=AA_CLIENT_CONFIG)
+        services: list[dict[str, Any]] = []
+        for page in ec2.get_paginator(
+            "describe_vpc_endpoint_service_configurations"
+        ).paginate():
+            services.extend(page.get("ServiceConfigurations") or [])
+        for svc in services:
+            sid = svc.get("ServiceId") or ""
+            if not sid or (svc.get("ServiceState") or "").lower() == "deleted":
+                continue
+            try:
+                pager = ec2.get_paginator("describe_vpc_endpoint_service_permissions")
+                principals: list[dict[str, Any]] = []
+                for page in pager.paginate(ServiceId=sid):
+                    principals.extend(page.get("AllowedPrincipals") or [])
+            except ClientError:
+                continue
+            for entry in principals:
+                ptype = entry.get("PrincipalType") or ""
+                value = (entry.get("Principal") or "").strip()
+                if ptype == "Service":
+                    continue
+                if ptype == "All" or value == "*":
+                    principal = "*"
+                elif value:
+                    principal = value
+                else:
+                    continue
+                row = _grant_from_principal_string(
+                    principal,
+                    resource=sid,
+                    resource_type="AWS::EC2::VPCEndpointService",
+                    mechanism="privatelink_allowed_principal",
+                    region=region,
+                    kwargs=kwargs,
+                    actions=["ec2:CreateVpcEndpoint"],
+                )
+                if row:
+                    grants.append(row)
+        return region, grants, None
+    except ClientError as e:
+        return region, [], e.response["Error"]["Message"]
+    except (BotoCoreError, Exception) as e:
+        return region, [], str(e)
+
+
+RESOURCE_POLICY_COLLECTORS: tuple[tuple[str, str, Any], ...] = (
+    ("KMS key policies and grants", "KMS", _collect_kms_in_region),
+    ("SNS topic policies", "SNS", _collect_sns_in_region),
+    ("SQS queue policies", "SQS", _collect_sqs_in_region),
+    ("Lambda resource policies", "Lambda", _collect_lambda_in_region),
+    ("Lambda layer permissions", "Lambda layers", _collect_lambda_layers_in_region),
+    ("Secrets Manager resource policies", "Secrets", _collect_secrets_in_region),
+    ("ECR repository policies", "ECR", _collect_ecr_in_region),
+    ("EFS file system policies", "EFS", _collect_efs_in_region),
+    ("DynamoDB table and stream policies", "DynamoDB", _collect_dynamodb_in_region),
+    ("EBS snapshot create-volume permissions", "EBS snapshots", _collect_ebs_snapshots_in_region),
+    ("RDS snapshot restore attributes", "RDS snapshots", _collect_rds_snapshots_in_region),
+)
+
+# Surfaces IAM Access Analyzer does not reason about. Run on both backends.
+BEYOND_AA_COLLECTORS: tuple[tuple[str, str, Any], ...] = (
+    ("EventBridge bus policies", "EventBridge", _collect_eventbridge_in_region),
+    ("Glue Data Catalog resource policies", "Glue", _collect_glue_in_region),
+    ("OpenSearch domain access policies", "OpenSearch", _collect_opensearch_in_region),
+    ("PrivateLink allowed principals", "PrivateLink", _collect_privatelink_in_region),
+)
+
+
+def collect_resource_policy_grants(
+    session: boto3.Session,
+    regions: list[str],
+    **kwargs: Any,
+) -> tuple[list[dict[str, Any]], list[dict[str, str]], list[dict[str, str]]]:
+    """Walk AA-class resource policies when Access Analyzer is not used.
+
+    Allow-principal matching. Customer-managed KMS keys also run ListGrants
+    (Access Analyzer already reasons about key policies *and* grants).
+    Also walks EFS/DynamoDB resource policies and EBS/RDS snapshot shares.
+    """
+    grants: list[dict[str, Any]] = []
+    scanned: list[dict[str, str]] = []
+    skipped: list[dict[str, str]] = []
+    if not regions:
+        skipped.append(
+            {
+                "surface": (
+                    "KMS / SNS / SQS / Lambda / Lambda layer / Secrets / ECR / "
+                    "EFS / DynamoDB policies and EBS/RDS snapshot shares"
+                ),
+                "detail": "No region configured; pass --region / --regions / --all-regions",
+            }
+        )
+        return grants, scanned, skipped
+
+    for surface, prefix, worker in RESOURCE_POLICY_COLLECTORS:
+        console.print(
+            f"[bold blue]Checking {surface} in {len(regions)} region(s)...[/bold blue]"
+        )
+        region_grants, failures = _run_regional_collector(
+            session, regions, worker, kwargs, warning_prefix=prefix
+        )
+        grants.extend(region_grants)
+        failed_ids = {region for region, _ in failures}
+        ok_regions = [region for region in regions if region not in failed_ids]
+        if ok_regions:
+            scanned.append({"surface": surface, "detail": ", ".join(ok_regions)})
+        for region, error in failures:
+            skipped.append({"surface": f"{surface} ({region})", "detail": error})
+        console.print(f"[green]{surface}: {len(region_grants)} grant(s)[/green]")
+    return grants, scanned, skipped
+
+
+def collect_beyond_aa_grants(
+    session: boto3.Session,
+    regions: list[str],
+    **kwargs: Any,
+) -> tuple[list[dict[str, Any]], list[dict[str, str]], list[dict[str, str]]]:
+    """Walk resource policies Access Analyzer does not cover (both backends)."""
+    grants: list[dict[str, Any]] = []
+    scanned: list[dict[str, str]] = []
+    skipped: list[dict[str, str]] = []
+    if not regions:
+        skipped.append(
+            {
+                "surface": "EventBridge / Glue / OpenSearch / PrivateLink",
+                "detail": "No region configured; pass --region / --regions / --all-regions",
+            }
+        )
+        return grants, scanned, skipped
+
+    for surface, prefix, worker in BEYOND_AA_COLLECTORS:
+        console.print(
+            f"[bold blue]Checking {surface} in {len(regions)} region(s)...[/bold blue]"
+        )
+        region_grants, failures = _run_regional_collector(
+            session, regions, worker, kwargs, warning_prefix=prefix
+        )
+        grants.extend(region_grants)
+        failed_ids = {region for region, _ in failures}
+        ok_regions = [region for region in regions if region not in failed_ids]
+        if ok_regions:
+            scanned.append({"surface": surface, "detail": ", ".join(ok_regions)})
+        for region, error in failures:
+            skipped.append({"surface": f"{surface} ({region})", "detail": error})
+        console.print(f"[green]{surface}: {len(region_grants)} grant(s)[/green]")
+    return grants, scanned, skipped
+
+
+def _ram_permission_actions(
+    ram_client: Any, share_arn: str, cache: dict[tuple[str, str], list[str]]
+) -> list[str]:
+    actions: list[str] = []
+    try:
+        perms = ram_client.list_resource_share_permissions(resourceShareArn=share_arn)
+    except ClientError:
+        return actions
+    for perm in perms.get("permissions", []):
+        arn = perm.get("arn") or ""
+        version = str(perm.get("version") or "")
+        key = (arn, version)
+        if key not in cache:
+            try:
+                detail = ram_client.get_permission(
+                    permissionArn=arn,
+                    permissionVersion=int(version) if version.isdigit() else 1,
+                )
+                doc = (detail.get("permission") or {}).get("permission")
+                cache[key] = actions_from_ram_permission(doc)
+            except (ClientError, TypeError, ValueError):
+                cache[key] = []
+        actions.extend(cache[key])
+    return list(dict.fromkeys(actions))
+
+
+def _collect_ram_in_region(
+    session: boto3.Session,
+    region: str,
+    kwargs: dict[str, Any],
+) -> tuple[str, list[dict[str, Any]], str | None]:
+    grants: list[dict[str, Any]] = []
+    try:
+        ram = session.client("ram", region_name=region, config=AA_CLIENT_CONFIG)
+        principals_by_share: dict[str, list[str]] = {}
+        resources_by_share: dict[str, list[str]] = {}
+        assoc_pager = ram.get_paginator("get_resource_share_associations")
+        for page in assoc_pager.paginate(associationType="PRINCIPAL"):
+            for assoc in page.get("resourceShareAssociations", []):
+                if assoc.get("status") != "ASSOCIATED":
+                    continue
+                entity = assoc.get("associatedEntity") or ""
+                share = assoc.get("resourceShareArn") or ""
+                if not entity or not share:
+                    continue
+                if is_aws_service_principal(entity):
+                    continue
+                principals_by_share.setdefault(share, []).append(entity)
+        for page in assoc_pager.paginate(associationType="RESOURCE"):
+            for assoc in page.get("resourceShareAssociations", []):
+                if assoc.get("status") != "ASSOCIATED":
+                    continue
+                entity = assoc.get("associatedEntity") or ""
+                share = assoc.get("resourceShareArn") or ""
+                if entity and share:
+                    resources_by_share.setdefault(share, []).append(entity)
+
+        perm_cache: dict[tuple[str, str], list[str]] = {}
+        for share_arn, principals in principals_by_share.items():
+            resources = resources_by_share.get(share_arn) or []
+            if not resources:
+                continue
+            actions = _ram_permission_actions(ram, share_arn, perm_cache)
+            for resource_arn in resources:
+                for principal in principals:
+                    parsed = parse_principal_value(
+                        "AWS",
+                        principal,
+                        our_organization_id=kwargs["our_organization_id"],
+                    )
+                    grant = grant_from_parsed_principal(
+                        parsed,
+                        statement=None,
+                        resource=resource_arn,
+                        resource_type="AWS::RAM::ResourceShare",
+                        mechanism="ram_share",
+                        trusted_accounts=kwargs["trusted_accounts"],
+                        account_to_vendor=kwargs["account_to_vendor"],
+                        current_account_id=kwargs["current_account_id"],
+                        region=region,
+                        owner_account=kwargs["owner_account"],
+                        owner_label=kwargs["owner_label"],
+                        actions=actions,
+                    )
+                    if grant:
+                        grants.append(grant)
+        return region, grants, None
+    except ClientError as e:
+        return region, [], e.response["Error"]["Message"]
+    except (BotoCoreError, Exception) as e:
+        return region, [], str(e)
+
+
+def _run_regional_collector(
+    session: boto3.Session,
+    regions: list[str],
+    worker: Any,
+    kwargs: dict[str, Any],
+    *,
+    warning_prefix: str,
+) -> tuple[list[dict[str, Any]], list[tuple[str, str]]]:
+    """Fan out a per-region worker. Failures are returned, not swallowed into coverage."""
+    grants: list[dict[str, Any]] = []
+    failures: list[tuple[str, str]] = []
+    if not regions:
+        return grants, failures
+    workers = min(AA_MAX_WORKERS, max(1, len(regions)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [
+            pool.submit(worker, session, region, kwargs) for region in regions
+        ]
+        for future in as_completed(futures):
+            region, region_grants, error = future.result()
+            if error:
+                console.print(
+                    f"[yellow]Warning: {warning_prefix} in {region}: {error}[/yellow]"
+                )
+                failures.append((region, error))
+                continue
+            grants.extend(region_grants)
+    order = {region: i for i, region in enumerate(regions)}
+    failures.sort(key=lambda item: order.get(item[0], 10_000))
+    return grants, failures
+
+
+def collect_ram_grants(
+    session: boto3.Session,
+    regions: list[str],
+    **kwargs: Any,
+) -> tuple[list[dict[str, Any]], list[tuple[str, str]]]:
+    """RAM resource shares: join ASSOCIATED principals to ASSOCIATED resources.
+
+    Does not use ``list-resources --principal`` (that API ignores the role name).
+    Pending invitations (ASSOCIATING) are skipped — they are not access yet.
+    """
+    console.print(
+        f"[bold blue]Checking RAM resource shares in {len(regions)} region(s)...[/bold blue]"
+    )
+    grants, failures = _run_regional_collector(
+        session, regions, _collect_ram_in_region, kwargs, warning_prefix="RAM"
+    )
+    console.print(f"[green]RAM share grants: {len(grants)}[/green]")
+    return grants, failures
+
+
+def _ami_grants_for_image(
+    ec2: Any,
+    image: dict[str, Any],
+    region: str,
+    kwargs: dict[str, Any],
+) -> list[dict[str, Any]]:
+    image_id = image.get("ImageId") or ""
+    grants: list[dict[str, Any]] = []
+    try:
+        attr = ec2.describe_image_attribute(
+            ImageId=image_id, Attribute="launchPermission"
+        )
+    except ClientError:
+        return grants
+    for perm in attr.get("LaunchPermissions", []):
+        if (perm.get("Group") or "").lower() == "all":
+            parsed = parse_principal_value("Wildcard", "*")
+        elif perm.get("UserId"):
+            parsed = parse_principal_value(
+                "AWS", perm["UserId"], our_organization_id=kwargs["our_organization_id"]
+            )
+        elif perm.get("OrganizationArn"):
+            parsed = parse_principal_value(
+                "AWS",
+                perm["OrganizationArn"],
+                our_organization_id=kwargs["our_organization_id"],
+            )
+        elif perm.get("OrganizationalUnitArn"):
+            parsed = parse_principal_value(
+                "AWS",
+                perm["OrganizationalUnitArn"],
+                our_organization_id=kwargs["our_organization_id"],
+            )
+        else:
+            continue
+        grant = grant_from_parsed_principal(
+            parsed,
+            statement=None,
+            resource=image_id,
+            resource_type="AWS::EC2::Image",
+            mechanism="ami_launch_permission",
+            trusted_accounts=kwargs["trusted_accounts"],
+            account_to_vendor=kwargs["account_to_vendor"],
+            current_account_id=kwargs["current_account_id"],
+            region=region,
+            owner_account=kwargs["owner_account"],
+            owner_label=kwargs["owner_label"],
+            actions=["ec2:RunInstances"],
+        )
+        if grant:
+            grants.append(grant)
+    return grants
+
+
+def _collect_ami_in_region(
+    session: boto3.Session,
+    region: str,
+    kwargs: dict[str, Any],
+) -> tuple[str, list[dict[str, Any]], str | None]:
+    grants: list[dict[str, Any]] = []
+    try:
+        ec2 = session.client("ec2", region_name=region, config=AA_CLIENT_CONFIG)
+        images: list[dict[str, Any]] = []
+        pager = ec2.get_paginator("describe_images")
+        for page in pager.paginate(Owners=["self"]):
+            images.extend(page.get("Images", []))
+        # Attribute reads are one-image-at-a-time; bound concurrency per region.
+        workers = min(8, max(1, len(images)))
+        if not images:
+            return region, [], None
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [
+                pool.submit(_ami_grants_for_image, ec2, image, region, kwargs)
+                for image in images
+            ]
+            for future in as_completed(futures):
+                grants.extend(future.result())
+        return region, grants, None
+    except ClientError as e:
+        return region, [], e.response["Error"]["Message"]
+    except (BotoCoreError, Exception) as e:
+        return region, [], str(e)
+
+
+def collect_ami_grants(
+    session: boto3.Session,
+    regions: list[str],
+    **kwargs: Any,
+) -> tuple[list[dict[str, Any]], list[tuple[str, str]]]:
+    """AMI launch permissions. OrganizationArn is not assumed internal."""
+    console.print(
+        f"[bold blue]Checking AMI launch permissions in {len(regions)} region(s)...[/bold blue]"
+    )
+    grants, failures = _run_regional_collector(
+        session, regions, _collect_ami_in_region, kwargs, warning_prefix="AMIs"
+    )
+    console.print(f"[green]AMI launch-permission grants: {len(grants)}[/green]")
+    return grants, failures
+
+
+def _collect_ssm_in_region(
+    session: boto3.Session,
+    region: str,
+    kwargs: dict[str, Any],
+) -> tuple[str, list[dict[str, Any]], str | None]:
+    grants: list[dict[str, Any]] = []
+    try:
+        ssm = session.client("ssm", region_name=region, config=AA_CLIENT_CONFIG)
+        pager = ssm.get_paginator("list_documents")
+        names: list[str] = []
+        for page in pager.paginate(Filters=[{"Key": "Owner", "Values": ["Self"]}]):
+            for doc in page.get("DocumentIdentifiers", []):
+                name = doc.get("Name")
+                if name:
+                    names.append(name)
+        for name in names:
+            try:
+                perm = ssm.describe_document_permission(
+                    Name=name, PermissionType="Share"
+                )
+            except ClientError:
+                continue
+            for acct in perm.get("AccountIds") or []:
+                if not isinstance(acct, str):
+                    continue
+                if acct.lower() == "all":
+                    parsed = parse_principal_value("Wildcard", "*")
+                else:
+                    parsed = parse_principal_value(
+                        "AWS", acct, our_organization_id=kwargs["our_organization_id"]
+                    )
+                grant = grant_from_parsed_principal(
+                    parsed,
+                    statement=None,
+                    resource=name,
+                    resource_type="AWS::SSM::Document",
+                    mechanism="ssm_document_share",
+                    trusted_accounts=kwargs["trusted_accounts"],
+                    account_to_vendor=kwargs["account_to_vendor"],
+                    current_account_id=kwargs["current_account_id"],
+                    region=region,
+                    owner_account=kwargs["owner_account"],
+                    owner_label=kwargs["owner_label"],
+                    actions=["ssm:GetDocument"],
+                )
+                if grant:
+                    grants.append(grant)
+        return region, grants, None
+    except ClientError as e:
+        return region, [], e.response["Error"]["Message"]
+    except (BotoCoreError, Exception) as e:
+        return region, [], str(e)
+
+
+def collect_ssm_document_grants(
+    session: boto3.Session,
+    regions: list[str],
+    **kwargs: Any,
+) -> tuple[list[dict[str, Any]], list[tuple[str, str]]]:
+    """SSM document share attributes (account-id lists, including public ``all``)."""
+    console.print(
+        f"[bold blue]Checking SSM document shares in {len(regions)} region(s)...[/bold blue]"
+    )
+    grants, failures = _run_regional_collector(
+        session, regions, _collect_ssm_in_region, kwargs, warning_prefix="SSM"
+    )
+    console.print(f"[green]SSM document share grants: {len(grants)}[/green]")
+    return grants, failures
+
+
+def _list_service_specific_credentials(iam_client: Any) -> list[dict[str, Any]]:
+    """List SSC for every user. Prefer unfiltered AllUsers; fall back per service."""
+    creds: list[dict[str, Any]] = []
+
+    def _pages(**extra: Any) -> list[dict[str, Any]]:
+        collected: list[dict[str, Any]] = []
+        marker = None
+        while True:
+            kwargs: dict[str, Any] = {"AllUsers": True, **extra}
+            if marker:
+                kwargs["Marker"] = marker
+            resp = iam_client.list_service_specific_credentials(**kwargs)
+            collected.extend(resp.get("ServiceSpecificCredentials") or [])
+            if not resp.get("IsTruncated"):
+                return collected
+            marker = resp.get("Marker")
+
+    try:
+        return _pages()
+    except ClientError:
+        for service in SERVICE_SPECIFIC_CREDENTIAL_SERVICES:
+            try:
+                creds.extend(_pages(ServiceName=service))
+            except ClientError as e:
+                console.print(
+                    f"[yellow]Warning: service-specific credentials for "
+                    f"{service}: {e.response['Error']['Message']}[/yellow]"
+                )
+        return creds
+
+
+def collect_service_specific_credential_grants(
+    session: boto3.Session,
+    **kwargs: Any,
+) -> list[dict[str, Any]]:
+    """IAM service-specific credentials / long-lived API keys (Bedrock, CW, …)."""
+    console.print("[bold blue]Checking IAM service-specific credentials...[/bold blue]")
+    grants: list[dict[str, Any]] = []
+    try:
+        iam = session.client("iam")
+        for cred in _list_service_specific_credentials(iam):
+            user = cred.get("UserName") or ""
+            service = cred.get("ServiceName") or ""
+            status = cred.get("Status") or "Active"
+            expiration = cred.get("ExpirationDate")
+            never = expiration is None
+            grants.append(
+                empty_grant(
+                    resource=user,
+                    resource_type="AWS::IAM::User",
+                    principal=service,
+                    principal_kind="credential",
+                    principal_label=f"{user} → {service}",
+                    mechanism="service_specific_credential",
+                    region="global",
+                    classification="unknown",
+                    never_expires=never and status == "Active",
+                    credential_status=status,
+                    actions=[service],
+                    owner_account=kwargs["current_account_id"],
+                    owner_label=kwargs["owner_label"],
+                )
+            )
+        console.print(
+            f"[green]Service-specific credentials: {len(grants)}[/green]"
+        )
     except Exception as e:
         console.print(
-            f"[bold red]Error checking S3 bucket policies: {e}[/bold red]"
+            f"[bold red]Error listing service-specific credentials: {e}[/bold red]"
         )
-        return {}, {}, {}
+    return grants
 
 
-def generate_report(
-    iam_known_vendors: dict[str, list[str]],
-    iam_unknown_accounts: dict[str, list[str]],
-    iam_trusted_entities: dict[str, dict[str, Any]],
-    iam_vulnerable_roles: dict[str, dict[str, Any]],
-    s3_known_vendors: dict[str, list[str]],
-    s3_unknown_accounts: dict[str, list[str]],
-    s3_trusted_entities: dict[str, dict[str, Any]],
-    account_aliases: dict[str, str],
-    output_dir: str = ".",
-    org_error: str | None = None,
+def collect_optional_scanners(
+    session: boto3.Session,
+    args: argparse.Namespace,
+    regions: list[str],
+    kwargs: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, str]], list[dict[str, str]]]:
+    """RAM / AMI / SSM / credentials / EventBridge / Glue / OpenSearch / PrivateLink collectors shared by both backends."""
+    grants: list[dict[str, Any]] = []
+    scanned: list[dict[str, str]] = []
+    skipped: list[dict[str, str]] = []
+
+    def _maybe(flag: str, surface: str, runner: Any) -> None:
+        if getattr(args, flag):
+            skipped.append({"surface": surface, "detail": f"--{flag.replace('_', '-')}"})
+            return
+        if not regions and flag in ("skip_ram", "skip_ami", "skip_ssm"):
+            skipped.append(
+                {
+                    "surface": surface,
+                    "detail": "No region configured; pass --region / --regions / --all-regions",
+                }
+            )
+            return
+        region_grants, failures = runner()
+        grants.extend(region_grants)
+        failed_ids = {region for region, _ in failures}
+        ok_regions = [region for region in regions if region not in failed_ids]
+        if ok_regions:
+            scanned.append({"surface": surface, "detail": ", ".join(ok_regions)})
+        for region, error in failures:
+            skipped.append(
+                {
+                    "surface": f"{surface} ({region})",
+                    "detail": error,
+                }
+            )
+
+    _maybe(
+        "skip_ram",
+        "RAM resource shares",
+        lambda: collect_ram_grants(session, regions, **kwargs),
+    )
+    _maybe(
+        "skip_ami",
+        "AMI launch permissions",
+        lambda: collect_ami_grants(session, regions, **kwargs),
+    )
+    _maybe(
+        "skip_ssm",
+        "SSM document shares",
+        lambda: collect_ssm_document_grants(session, regions, **kwargs),
+    )
+    if args.skip_credentials:
+        skipped.append(
+            {
+                "surface": "IAM service-specific credentials",
+                "detail": "--skip-credentials",
+            }
+        )
+    else:
+        grants.extend(collect_service_specific_credential_grants(session, **kwargs))
+        scanned.append(
+            {
+                "surface": "IAM service-specific credentials",
+                "detail": "account-wide (CodeCommit, Keyspaces, Bedrock, CloudWatch, Claude)",
+            }
+        )
+    extra, extra_scanned, extra_skipped = collect_beyond_aa_grants(
+        session, regions, **kwargs
+    )
+    grants.extend(extra)
+    scanned.extend(extra_scanned)
+    skipped.extend(extra_skipped)
+    return grants, scanned, skipped
+
+
+def _report_filename(
+    output_dir: str, identity_slug: str, extension: str
 ) -> str:
-    """Generate a markdown report with the findings."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return os.path.join(
+        output_dir, f"trustline_report_{identity_slug}_{timestamp}.{extension}"
+    )
 
+
+def _coverage_markdown(coverage: dict[str, Any]) -> str:
+    lines = ["## Coverage (appendix)\n"]
+    lines.append(
+        "A green leftover list only covers **scanned** surfaces. "
+        "This section is last on purpose — the inventory is the work list.\n"
+    )
+    backend = coverage.get("backend", "")
+    if backend:
+        lines.append(f"- Backend: `{backend}`\n")
+    if coverage.get("regions"):
+        lines.append(
+            f"- Regions: `{', '.join(coverage['regions'])}`"
+            + (" (all enabled)" if coverage.get("all_regions") else "")
+            + "\n"
+        )
+    for note in coverage.get("analyzer_notes") or []:
+        lines.append(f"- {note}\n")
+    lines.append("\n### Scanned\n\n")
+    scanned = coverage.get("scanned") or []
+    if scanned:
+        lines.append("| Surface | Detail |\n|---------|--------|\n")
+        for item in scanned:
+            lines.append(f"| {item['surface']} | {item['detail']} |\n")
+    else:
+        lines.append("Nothing was scanned.\n")
+    lines.append("\n### Not scanned\n\n")
+    lines.append("| Surface | Why |\n|---------|-----|\n")
+    for item in coverage.get("not_scanned") or []:
+        lines.append(f"| {item['surface']} | {item['detail']} |\n")
+    lines.append("\n")
+    return "".join(lines)
+
+
+def _grant_resource_name(grant: dict[str, Any]) -> str:
+    return grant_resource_label(grant)
+
+
+def _party_resource_summary(party: dict[str, Any], *, limit: int = 6) -> str:
+    items = party.get("grants") or []
+    if items:
+        names = [grant_resource_label(g) for g in items]
+    else:
+        names = [grant_resource_label({"resource": r}) for r in (party.get("resources") or []) if r]
+    names = list(dict.fromkeys(names))
+    if len(names) > limit:
+        return ", ".join(names[:limit]) + f" +{len(names) - limit} more"
+    return ", ".join(names) or "—"
+
+
+def _inventory_markdown(grants: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
+    parties = parties_from_grants(grants)
+    blocked = [g for g in grants if g.get("blocked_by_bpa")]
+    lines = [
+        "## External access (by principal)\n\n",
+        "One row per external party. Account IDs are looked up in "
+        "[fwd:cloudsec known AWS accounts](https://github.com/fwdcloudsec/known_aws_accounts). "
+        "Unresolved means the ID was not in that dataset, your YAML, or Organizations.\n\n",
+    ]
+    if not parties:
+        lines.append("No current external access in scanned surfaces.\n\n")
+    else:
+        lines.append(
+            "| Principal | Name source | Classification | Grants | Mechanisms | Resources |\n"
+            "|-----------|-------------|----------------|--------|------------|-----------|\n"
+        )
+        for party in parties:
+            lines.append(
+                f"| {party['name']} | {party['name_source_label']} | "
+                f"{party['classification']} | {party['grant_count']} | "
+                f"{', '.join(party['mechanisms'])} | {_party_resource_summary(party)} |\n"
+            )
+        lines.append("\n")
+    return "".join(lines), blocked
+
+
+def generate_markdown_report(
+    grants: list[dict[str, Any]],
+    coverage: dict[str, Any],
+    *,
+    account_aliases: dict[str, str],
+    org_error: str | None = None,
+    output_dir: str = ".",
+    identity_slug: str | None = None,
+    identity_label: str | None = None,
+) -> str:
+    """Write a report: inventory by principal, then leftover flags, coverage last."""
     current_account_id = (
         list(account_aliases.keys())[0] if account_aliases else "Unknown"
     )
     current_account_alias = account_aliases.get(current_account_id, current_account_id)
+    slug = identity_slug or current_account_id
+    label = identity_label or f"{current_account_id} ({current_account_alias})"
+    report_file = _report_filename(output_dir, slug, "md")
+    totals = totals_from_grants(grants)
+    parties = parties_from_grants(grants)
+    ptotals = party_totals(parties)
 
-    report_file = os.path.join(
-        output_dir, f"trustline_report_{current_account_id}_{timestamp}.md"
-    )
+    def _rows(predicate) -> list[dict[str, Any]]:
+        return [g for g in grants if predicate(g)]
+
+    inventory, blocked = _inventory_markdown(grants)
 
     with open(report_file, "w") as f:
         f.write("# AWS Trustline - Access Analysis Report\n\n")
         f.write(f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write(f"Account: {current_account_id} ({current_account_alias})\n\n")
-
+        f.write(f"Account/scope: {label}\n\n")
         if org_error:
             f.write("## AWS Organizations Access\n\n")
-            f.write(f"Could not access AWS Organizations API: {org_error}\n")
-            f.write(
-                "\nThis means the report may be missing trusted accounts from your AWS Organization.\n"
-            )
-            f.write(
-                "To fix this, ensure the IAM identity running Trustline has the `organizations:ListAccounts` permission.\n\n"
-            )
-
-        f.write("# IAM Roles Analysis\n\n")
-
-        f.write("## Trusted Entities with IAM Role Access\n\n")
-        if iam_trusted_entities:
-            f.write("| Entity | Source | IAM Roles |\n")
-            f.write("|--------|--------|----------|\n")
-            for entity, data in iam_trusted_entities.items():
-                f.write(
-                    f"| {entity} | {data['source']} | {', '.join(data['roles'])} |\n"
-                )
-        else:
-            f.write("No trusted entities found in IAM role trust policies.\n")
-        f.write("\n")
-
-        f.write("## Known Vendors with IAM Role Access\n\n")
-        if iam_known_vendors:
-            f.write("| Vendor | IAM Roles |\n")
-            f.write("|--------|----------|\n")
-            for vendor, roles in iam_known_vendors.items():
-                f.write(f"| {vendor} | {', '.join(roles)} |\n")
-        else:
-            f.write("No known vendors found in IAM role trust policies.\n")
-        f.write("\n")
-
-        f.write("## Unknown AWS Accounts with IAM Role Access\n\n")
-        if iam_unknown_accounts:
-            f.write("| AWS Account ID | Account Name | IAM Roles |\n")
-            f.write("|---------------|------------|----------|\n")
-            for account_id, roles in iam_unknown_accounts.items():
-                account_name = account_aliases.get(account_id, "Unknown")
-                f.write(f"| {account_id} | {account_name} | {', '.join(roles)} |\n")
-        else:
-            f.write("No unknown AWS accounts found in IAM role trust policies.\n")
-        f.write("\n")
-
-        f.write("## IAM Roles Missing ExternalId Condition\n\n")
+            f.write(f"Could not access AWS Organizations API: {org_error}\n\n")
+        f.write("## Summary\n\n")
         f.write(
-            "These roles are vulnerable to the [confused deputy problem]"
-            "(https://docs.aws.amazon.com/IAM/latest/UserGuide/confused-deputy.html).\n\n"
+            f"- External parties: {ptotals['parties']}\n"
+            f"- Unknown parties: {ptotals['unknown']}\n"
+            f"- Public parties: {ptotals['public']}\n"
+            f"- Vendor parties: {ptotals['vendor']}\n"
+            f"- Federated parties: {ptotals['federated']}\n"
+            f"- Trusted parties: {ptotals['trusted']}\n"
+            f"- Missing ExternalId (grants): {totals['missing_external_id']}\n"
+            f"- OIDC missing sub/aud (grants): {totals['missing_oidc_subject']}\n"
+            f"- Never-expiring service credentials: {totals['never_expires']}\n"
+            f"- Blocked by Block Public Access (grants): {totals['blocked_public']}\n"
+            f"- Total grants: {totals['findings']}\n\n"
         )
-        if iam_vulnerable_roles:
-            f.write("| Entity | Source | Vulnerable IAM Roles |\n")
-            f.write("|--------|--------|--------------------|\n")
-            for entity, data in iam_vulnerable_roles.items():
+        f.write(inventory)
+        f.write(party_details_markdown(parties))
+
+        def write_grant_table(title: str, items: list[dict[str, Any]]) -> None:
+            if not items:
+                return
+            f.write(f"## {title}\n\n")
+            f.write("| Resource | Principal | Mechanism | Classification |\n")
+            f.write("|----------|-----------|-----------|----------------|\n")
+            for g in items:
                 f.write(
-                    f"| {entity} | {data['source']} | {', '.join(data['roles'])} |\n"
+                    f"| {g.get('resource', '')} | {g.get('principal_label') or g.get('principal')} "
+                    f"| {MECHANISM_LABELS.get(g.get('mechanism', ''), g.get('mechanism', ''))} "
+                    f"| {g.get('classification')} |\n"
                 )
-        else:
-            f.write("No vulnerable IAM roles found.\n")
-        f.write("\n")
+            f.write("\n")
 
-        f.write("# S3 Bucket Policies Analysis\n\n")
-
-        f.write("## Trusted Entities with S3 Bucket Access\n\n")
-        if s3_trusted_entities:
-            f.write("| Entity | Source | S3 Buckets |\n")
-            f.write("|--------|--------|----------|\n")
-            for entity, data in s3_trusted_entities.items():
-                f.write(
-                    f"| {entity} | {data['source']} | {', '.join(data['buckets'])} |\n"
-                )
-        else:
-            f.write("No trusted entities found in S3 bucket policies.\n")
-        f.write("\n")
-
-        f.write("## Known Vendors with S3 Bucket Access\n\n")
-        if s3_known_vendors:
-            f.write("| Vendor | S3 Buckets |\n")
-            f.write("|--------|----------|\n")
-            for vendor, buckets in s3_known_vendors.items():
-                f.write(f"| {vendor} | {', '.join(buckets)} |\n")
-        else:
-            f.write("No known vendors found in S3 bucket policies.\n")
-        f.write("\n")
-
-        f.write("## Unknown AWS Accounts with S3 Bucket Access\n\n")
-        if s3_unknown_accounts:
-            f.write("| AWS Account ID | Account Name | S3 Buckets |\n")
-            f.write("|---------------|------------|----------|\n")
-            for account_id, buckets in s3_unknown_accounts.items():
-                account_name = account_aliases.get(account_id, "Unknown")
-                f.write(f"| {account_id} | {account_name} | {', '.join(buckets)} |\n")
-        else:
-            f.write("No unknown AWS accounts found in S3 bucket policies.\n")
-
+        write_grant_table(
+            "OIDC trusts missing sub/aud conditions",
+            _rows(lambda g: g.get("missing_oidc_subject")),
+        )
+        write_grant_table(
+            "IAM roles missing ExternalId condition",
+            _rows(lambda g: g.get("missing_external_id")),
+        )
+        write_grant_table(
+            "Never-expiring service-specific credentials",
+            _rows(lambda g: g.get("never_expires")),
+        )
+        write_grant_table(
+            "Policy allows everyone; Block Public Access denies it",
+            blocked,
+        )
+        f.write(_coverage_markdown(coverage))
     return report_file
 
 
-def _truncated_list(items: list[str], limit: int = 5) -> str:
-    result = "\n".join(items[:limit])
-    if len(items) > limit:
-        result += "\n..."
-    return result
-
-
-def display_results(
-    iam_known_vendors: dict[str, list[str]],
-    iam_unknown_accounts: dict[str, list[str]],
-    iam_trusted_entities: dict[str, dict[str, Any]],
-    iam_vulnerable_roles: dict[str, dict[str, Any]],
-    s3_known_vendors: dict[str, list[str]],
-    s3_unknown_accounts: dict[str, list[str]],
-    s3_trusted_entities: dict[str, dict[str, Any]],
+def display_grants(
+    grants: list[dict[str, Any]],
+    coverage: dict[str, Any],
     account_aliases: dict[str, str],
 ) -> None:
-    """Display analysis results in formatted console tables."""
+    """Render the principal inventory, then leftover flags."""
     current_account_id = (
         list(account_aliases.keys())[0] if account_aliases else "Unknown"
     )
     current_account_alias = account_aliases.get(current_account_id, current_account_id)
+    totals = totals_from_grants(grants)
+    parties = parties_from_grants(grants)
+    ptotals = party_totals(parties)
 
     console.print(
-        f"\n[cyan]Analyzing AWS Account:[/cyan] {current_account_id} ({current_account_alias})\n"
+        f"\n[cyan]Analyzing:[/cyan] {current_account_id} ({current_account_alias})\n"
     )
 
-    if iam_trusted_entities:
-        table = Table(title="Trusted Entities with IAM Role Access", box=box.ROUNDED)
-        table.add_column("Entity", style="green")
-        table.add_column("Source", style="blue")
-        table.add_column("IAM Roles", style="blue")
-        for entity, data in iam_trusted_entities.items():
-            table.add_row(entity, data["source"], _truncated_list(data["roles"]))
-        console.print(table)
+    class_style = {
+        "unknown": "yellow",
+        "public": "red",
+        "vendor": "magenta",
+        "federated": "blue",
+        "trusted": "green",
+    }
 
-    if iam_known_vendors:
-        table = Table(title="Known Vendors with IAM Role Access", box=box.ROUNDED)
-        table.add_column("Vendor", style="cyan")
-        table.add_column("IAM Roles", style="green")
-        for vendor, roles in iam_known_vendors.items():
-            table.add_row(vendor, _truncated_list(roles))
-        console.print(table)
-
-    if iam_unknown_accounts:
-        table = Table(title="Unknown AWS Accounts with IAM Role Access", box=box.ROUNDED)
-        table.add_column("AWS Account ID", style="yellow")
-        table.add_column("IAM Roles", style="green")
-        for account_id, roles in iam_unknown_accounts.items():
-            table.add_row(account_id, _truncated_list(roles))
-        console.print(table)
-
-    if iam_vulnerable_roles:
+    if parties:
         table = Table(
-            title="IAM Roles Missing ExternalId Condition (Confused Deputy Risk)",
+            title=f"External access by principal ({len(parties)})",
             box=box.ROUNDED,
         )
-        table.add_column("Entity", style="red")
-        table.add_column("Source", style="blue")
-        table.add_column("Vulnerable IAM Roles", style="red")
-        for entity, data in iam_vulnerable_roles.items():
-            table.add_row(entity, data["source"], _truncated_list(data["roles"]))
+        table.add_column("Principal", style="cyan", overflow="fold")
+        table.add_column("Name source", style="blue", overflow="fold")
+        table.add_column("Class")
+        table.add_column("Grants", justify="right")
+        table.add_column("Resources", overflow="fold")
+        for party in parties[:50]:
+            klass = party["classification"]
+            table.add_row(
+                party["name"],
+                party["name_source_label"],
+                f"[{class_style.get(klass, 'white')}]{klass}[/]",
+                str(party["grant_count"]),
+                _party_resource_summary(party),
+            )
+        if len(parties) > 50:
+            table.add_row("…", f"+{len(parties) - 50} more", "", "", "")
         console.print(table)
 
-    if s3_trusted_entities:
-        table = Table(title="Trusted Entities with S3 Bucket Access", box=box.ROUNDED)
-        table.add_column("Entity", style="green")
-        table.add_column("Source", style="blue")
-        table.add_column("S3 Buckets", style="blue")
-        for entity, data in s3_trusted_entities.items():
-            table.add_row(entity, data["source"], _truncated_list(data["buckets"]))
+    def _table(title: str, items: list[dict[str, Any]], color: str) -> None:
+        if not items:
+            return
+        table = Table(title=f"{title} ({len(items)})", box=box.ROUNDED)
+        table.add_column("Resource", style="cyan", overflow="fold")
+        table.add_column("Principal", style=color, overflow="fold")
+        table.add_column("Mechanism", style="blue")
+        table.add_column("Classification", style="green")
+        for g in items[:50]:
+            table.add_row(
+                _grant_resource_name(g),
+                g.get("principal_label") or g.get("principal") or "-",
+                MECHANISM_LABELS.get(g.get("mechanism") or "", g.get("mechanism") or "-"),
+                g.get("classification") or "-",
+            )
+        if len(items) > 50:
+            table.add_row("…", f"+{len(items) - 50} more", "", "")
         console.print(table)
 
-    if s3_known_vendors:
-        table = Table(title="Known Vendors with S3 Bucket Access", box=box.ROUNDED)
-        table.add_column("Vendor", style="cyan")
-        table.add_column("S3 Buckets", style="green")
-        for vendor, buckets in s3_known_vendors.items():
-            table.add_row(vendor, _truncated_list(buckets))
-        console.print(table)
-
-    if s3_unknown_accounts:
-        table = Table(title="Unknown AWS Accounts with S3 Bucket Access", box=box.ROUNDED)
-        table.add_column("AWS Account ID", style="yellow")
-        table.add_column("S3 Buckets", style="green")
-        for account_id, buckets in s3_unknown_accounts.items():
-            table.add_row(account_id, _truncated_list(buckets))
-        console.print(table)
-
-    total_trusted = len(iam_trusted_entities) + len(s3_trusted_entities)
-    total_known = len(iam_known_vendors) + len(s3_known_vendors)
-    total_unknown = len(iam_unknown_accounts) + len(s3_unknown_accounts)
-    total_vulnerable = len(iam_vulnerable_roles)
+    _table(
+        "OIDC missing sub/aud",
+        [g for g in grants if g.get("missing_oidc_subject")],
+        "red",
+    )
+    _table(
+        "Missing ExternalId",
+        [g for g in grants if g.get("missing_external_id")],
+        "red",
+    )
+    _table(
+        "Never-expiring credentials",
+        [g for g in grants if g.get("never_expires")],
+        "red",
+    )
+    _table(
+        "Blocked by Block Public Access",
+        [g for g in grants if g.get("blocked_by_bpa")],
+        "yellow",
+    )
 
     console.print(
         Panel(
             f"[bold]Summary:[/bold]\n"
-            f"[green]Trusted entities found:[/green] {total_trusted}\n"
-            f"[cyan]Known vendors found:[/cyan] {total_known}\n"
-            f"[yellow]Unknown AWS accounts found:[/yellow] {total_unknown}\n"
-            f"[red]Vulnerable IAM roles (missing ExternalId):[/red] {total_vulnerable}",
+            f"[cyan]External parties:[/cyan] {ptotals['parties']}\n"
+            f"[yellow]Unknown parties:[/yellow] {ptotals['unknown']}\n"
+            f"[red]Public parties:[/red] {ptotals['public']}\n"
+            f"[magenta]Vendor parties:[/magenta] {ptotals['vendor']}\n"
+            f"[blue]Federated parties:[/blue] {ptotals['federated']}\n"
+            f"[green]Trusted parties:[/green] {ptotals['trusted']}\n"
+            f"[red]Missing ExternalId (grants):[/red] {totals['missing_external_id']}\n"
+            f"[red]OIDC missing sub/aud (grants):[/red] {totals['missing_oidc_subject']}\n"
+            f"[red]Never-expiring credentials:[/red] {totals['never_expires']}\n"
+            f"[dim]Blocked by BPA (grants):[/dim] {totals['blocked_public']}\n"
+            f"[bold]Total grants:[/bold] {totals['findings']}",
             title="AWS Trustline Results",
             box=box.ROUNDED,
         )
     )
+    scanned_names = [item["surface"] for item in (coverage.get("scanned") or [])]
+    if len(scanned_names) > 8:
+        scanned_bit = ", ".join(scanned_names[:8]) + f" +{len(scanned_names) - 8} more"
+    else:
+        scanned_bit = ", ".join(scanned_names)
+    aa_note = ""
+    if coverage.get("backend") == "access_analyzer":
+        aa_note = " Analyzer ACTIVE is not scan-complete."
+    console.print(
+        Panel(
+            f"[dim]Scanned:[/dim] {scanned_bit or '—'}\n"
+            f"[dim]Not scanned:[/dim] {len(coverage.get('not_scanned') or [])} surfaces "
+            f"(see report appendix).{aa_note}",
+            title="Coverage",
+            box=box.ROUNDED,
+        )
+    )
+    if coverage.get("backend") != "access_analyzer":
+        for note in coverage.get("analyzer_notes") or []:
+            console.print(f"[yellow]{note}[/yellow]")
 
 
 def resolve_regions(session: boto3.Session, args: argparse.Namespace) -> list[str]:
@@ -731,6 +2117,7 @@ def _list_analyzers_in_region(
                         "arn": analyzer["arn"],
                         "type": analyzer["type"],
                         "name": analyzer.get("name", ""),
+                        "created_at": str(analyzer.get("createdAt") or ""),
                     }
                 )
         return region, candidates, None
@@ -751,8 +2138,9 @@ def find_external_analyzers(
 
     - ``account`` keeps only analyzers of type ``ACCOUNT``.
     - ``organization`` keeps only analyzers of type ``ORGANIZATION``.
-    - ``auto`` keeps both but prefers ``ORGANIZATION`` per region when both
-      exist (org coverage is a superset of account coverage).
+    - ``auto`` keeps both but prefers ``ACCOUNT`` per region (this-account
+      inventory). ORGANIZATION is used only when no ACCOUNT analyzer exists
+      in that region.
 
     Returns a ``{region: {"arn": ..., "type": ..., "name": ...}}`` mapping.
     Regions with no matching analyzer are omitted; the caller is expected to
@@ -790,48 +2178,185 @@ def find_external_analyzers(
             if not candidates:
                 continue
 
-            if scope == "auto":
-                org = next(
-                    (c for c in candidates if c["type"] == "ORGANIZATION"), None
-                )
-                chosen = org if org is not None else candidates[0]
-            else:
-                chosen = candidates[0]
-
+            chosen = choose_external_analyzer(candidates, scope)
+            if chosen is None:
+                continue
             discovered[region] = chosen
 
     return discovered
 
 
-def _principal_account_ids(principal: dict[str, str] | None) -> list[str]:
-    """Extract account IDs from an Access Analyzer ``principal`` map.
+def _count_findings_in_region(
+    session: boto3.Session,
+    region: str,
+    analyzer: dict[str, str],
+) -> tuple[str, int, str | None, str | None]:
+    """Return (region, count, newest_analyzed_at, error)."""
+    try:
+        client = session.client(
+            "accessanalyzer", region_name=region, config=AA_CLIENT_CONFIG
+        )
+        paginator = client.get_paginator("list_findings")
+        count = 0
+        newest: datetime | None = None
+        for page in paginator.paginate(
+            analyzerArn=analyzer["arn"],
+            filter={"status": {"eq": ["ACTIVE"]}},
+        ):
+            for raw in page.get("findings", []):
+                count += 1
+                analyzed = raw.get("analyzedAt")
+                if analyzed is None:
+                    continue
+                if not isinstance(analyzed, datetime):
+                    try:
+                        analyzed = datetime.fromisoformat(str(analyzed).replace("Z", "+00:00"))
+                    except ValueError:
+                        continue
+                if newest is None or analyzed > newest:
+                    newest = analyzed
+        newest_s = newest.isoformat() if newest else None
+        return region, count, newest_s, None
+    except ClientError as e:
+        return region, 0, None, e.response["Error"]["Message"]
+    except (BotoCoreError, Exception) as e:
+        return region, 0, None, str(e)
 
-    Access Analyzer findings carry a flat principal dict, typically shaped
-    like ``{"AWS": "<arn-or-account>"}`` or ``{"Federated": "..."}``. Only
-    values that reduce to a 12-digit account ID are returned.
+
+def wait_for_analyzer_findings(
+    session: boto3.Session,
+    analyzers: dict[str, dict[str, str]],
+    timeout: int,
+    interval: int = 15,
+) -> list[str]:
+    """Poll ACTIVE finding counts until they stabilize or ``timeout`` seconds elapse.
+
+    Analyzer status ACTIVE is not 'scan finished'. There is no API field that
+    separates the two, so we wait until counts stop changing for two intervals.
     """
-    if not principal:
-        return []
-    out: list[str] = []
-    for value in principal.values():
-        if not isinstance(value, str):
+    deadline = time.time() + max(1, timeout)
+    last_counts: dict[str, int] | None = None
+    stable_rounds = 0
+    notes: list[str] = []
+    console.print(
+        f"[bold blue]Waiting up to {timeout}s for Access Analyzer findings to "
+        f"stabilize (ACTIVE ≠ complete)...[/bold blue]"
+    )
+    while time.time() < deadline:
+        counts: dict[str, int] = {}
+        analyzed_ats: list[str] = []
+        workers = min(AA_MAX_WORKERS, max(1, len(analyzers)))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(_count_findings_in_region, session, region, analyzer): region
+                for region, analyzer in analyzers.items()
+            }
+            for future in as_completed(futures):
+                region, count, newest, error = future.result()
+                if error:
+                    console.print(
+                        f"[yellow]Warning: wait poll in {region}: {error}[/yellow]"
+                    )
+                    continue
+                counts[region] = count
+                if newest:
+                    analyzed_ats.append(newest)
+        total = sum(counts.values())
+        console.print(
+            f"[dim]Analyzer poll: {total} ACTIVE finding(s) across "
+            f"{len(counts)} region(s)[/dim]"
+        )
+        if last_counts is not None and counts == last_counts:
+            stable_rounds += 1
+            if stable_rounds >= 2:
+                if analyzed_ats:
+                    notes.append(
+                        f"Newest finding analyzedAt after wait: {max(analyzed_ats)}"
+                    )
+                else:
+                    notes.append(
+                        "Analyzer reported 0 findings after wait. If it was created "
+                        "recently, the first scan can take ~20 minutes."
+                    )
+                return notes
+        else:
+            stable_rounds = 0
+        last_counts = counts
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        time.sleep(min(interval, remaining))
+    notes.append(
+        f"Waited {timeout}s without a stable finding count. Report may be incomplete."
+    )
+    return notes
+
+
+def _assume_role_policy_document(iam_client: Any, role_name: str) -> dict[str, Any] | None:
+    """Live AssumeRolePolicyDocument, or None if GetRole fails."""
+    try:
+        role = iam_client.get_role(RoleName=role_name)
+        doc = (role.get("Role") or {}).get("AssumeRolePolicyDocument")
+        if isinstance(doc, str):
+            return json.loads(unquote(doc))
+        if isinstance(doc, dict):
+            return doc
+    except (ClientError, BotoCoreError, json.JSONDecodeError, TypeError, ValueError):
+        return None
+    return None
+
+
+def enrich_aa_iam_role_conditions(
+    session: boto3.Session,
+    grants: list[dict[str, Any]],
+    current_account_id: str,
+) -> list[str]:
+    """Replace AA leftover flags with live trust-policy conditions when possible.
+
+    Access Analyzer often omits Condition. Empty condition is not proof the
+    role is missing sub/aud or ExternalId.
+    """
+    notes: list[str] = []
+    skipped = 0
+    iam = session.client("iam")
+    cache: dict[str, dict[str, Any] | None] = {}
+    for grant in grants:
+        if grant.get("resource_type") != "AWS::IAM::Role":
             continue
-        acct = _extract_account_id_from_value(value)
-        if acct:
-            out.append(acct)
-    return out
-
-
-def _aa_finding_has_external_id(condition: dict[str, Any] | None) -> bool:
-    """Return True if the AA finding's condition includes ``sts:ExternalId``.
-
-    AA flattens the condition into a ``{condition_key: value}`` dict (it does
-    not preserve the StringEquals/StringLike operator nesting), so a simple
-    presence check is sufficient here.
-    """
-    if not condition:
-        return False
-    return any(isinstance(k, str) and k.lower() == "sts:externalid" for k in condition)
+        if grant.get("mechanism") != "access_analyzer":
+            continue
+        owner = grant.get("resource_owner") or grant.get("owner_account") or ""
+        other_account = bool(
+            current_account_id and owner and owner != current_account_id
+        )
+        aa_empty = not flatten_condition_keys(grant.get("condition"))
+        if other_account:
+            if aa_empty:
+                clear_unproven_aa_condition_flags(grant)
+                skipped += 1
+            continue
+        role_name = role_name_from_resource(grant.get("resource") or "")
+        if not role_name:
+            if aa_empty:
+                clear_unproven_aa_condition_flags(grant)
+                skipped += 1
+            continue
+        if role_name not in cache:
+            cache[role_name] = _assume_role_policy_document(iam, role_name)
+        doc = cache[role_name]
+        if not doc:
+            if aa_empty:
+                clear_unproven_aa_condition_flags(grant)
+                skipped += 1
+            continue
+        apply_live_trust_conditions(grant, doc)
+    if skipped:
+        notes.append(
+            f"OIDC/ExternalId flags omitted for {skipped} Access Analyzer IAM role "
+            "finding(s) with no conditions (other-account resource or GetRole "
+            "failed). Those flags are not proven leftovers."
+        )
+    return notes
 
 
 def _list_findings_in_region(
@@ -843,8 +2368,14 @@ def _list_findings_in_region(
     trusted_accounts: dict[str, dict[str, Any]],
     account_aliases: dict[str, str],
     org_accounts: dict[str, dict[str, Any]],
-) -> tuple[str, list[dict[str, Any]] | None, str | None]:
-    """Worker for parallel finding collection. Returns (region, findings, error)."""
+    our_organization_id: str | None = None,
+    restrict_to_owner: str | None = None,
+) -> tuple[str, list[dict[str, Any]] | None, str | None, int]:
+    """Worker for parallel finding collection.
+
+    Returns (region, findings, error, dropped_other_owner_count).
+    """
+    dropped = 0
     try:
         client = session.client(
             "accessanalyzer", region_name=region, config=AA_CLIENT_CONFIG
@@ -856,22 +2387,27 @@ def _list_findings_in_region(
             filter={"status": {"eq": ["ACTIVE"]}},
         ):
             for raw in page.get("findings", []):
-                out.append(
-                    _classify_aa_finding(
-                        raw,
-                        region=region,
-                        analyzer_type=analyzer["type"],
-                        account_to_vendor=account_to_vendor,
-                        trusted_accounts=trusted_accounts,
-                        account_aliases=account_aliases,
-                        org_accounts=org_accounts,
-                    )
+                owner = raw.get("resourceOwnerAccount") or ""
+                if restrict_to_owner and owner and owner != restrict_to_owner:
+                    dropped += 1
+                    continue
+                grant = _classify_aa_finding(
+                    raw,
+                    region=region,
+                    analyzer_type=analyzer["type"],
+                    account_to_vendor=account_to_vendor,
+                    trusted_accounts=trusted_accounts,
+                    account_aliases=account_aliases,
+                    org_accounts=org_accounts,
+                    our_organization_id=our_organization_id,
                 )
-        return region, out, None
+                if grant:
+                    out.append(grant)
+        return region, out, None, dropped
     except ClientError as e:
-        return region, None, e.response["Error"]["Message"]
+        return region, None, e.response["Error"]["Message"], dropped
     except (BotoCoreError, Exception) as e:
-        return region, None, str(e)
+        return region, None, str(e), dropped
 
 
 def collect_access_analyzer_findings(
@@ -881,29 +2417,21 @@ def collect_access_analyzer_findings(
     account_aliases: dict[str, str],
     org_accounts: dict[str, dict[str, Any]],
     analyzers: dict[str, dict[str, str]],
+    our_organization_id: str | None = None,
+    restrict_to_owner: str | None = None,
 ) -> dict[str, Any]:
     """Collect and classify findings from one or more external analyzers.
 
-    Pages ACTIVE findings from each discovered analyzer in parallel (one
-    worker per region under short timeouts) and produces a normalized data
-    structure keyed by AWS resource type. Each finding is classified as
-    ``trusted``, ``vendor``, ``unknown`` or ``public`` and, for IAM roles,
-    flagged when ``sts:ExternalId`` is missing from the AA condition map.
-    """
-    findings_by_type: dict[str, list[dict[str, Any]]] = {}
-    missing_external_id: list[dict[str, Any]] = []
-    public_findings: list[dict[str, Any]] = []
+    Each finding is a grant row classified as trusted, vendor, unknown,
+    public, or federated. IAM roles missing ``sts:ExternalId`` and GitHub/GitLab
+    OIDC trusts missing ``sub``/``aud`` are flagged on the row after reading
+    the live trust policy when GetRole is allowed.
 
-    totals = {
-        "trusted": 0,
-        "vendors": 0,
-        "unknown": 0,
-        "public": 0,
-        "missing_external_id": 0,
-        "findings": 0,
-        "regions": len(analyzers),
-    }
-    seen_owners: set[str] = set()
+    ``restrict_to_owner`` drops ORGANIZATION-analyzer findings owned by other
+    accounts so a default account-scope scan is not an org dump.
+    """
+    grants: list[dict[str, Any]] = []
+    dropped_other_owners = 0
 
     console.print(
         f"[bold blue]Collecting findings from {len(analyzers)} analyzer(s) "
@@ -922,11 +2450,14 @@ def collect_access_analyzer_findings(
                 trusted_accounts=trusted_accounts,
                 account_aliases=account_aliases,
                 org_accounts=org_accounts,
+                our_organization_id=our_organization_id,
+                restrict_to_owner=restrict_to_owner,
             ): region
             for region, analyzer in analyzers.items()
         }
         for future in as_completed(futures):
-            region, findings, error = future.result()
+            region, findings, error, dropped = future.result()
+            dropped_other_owners += dropped
             if error is not None:
                 console.print(
                     f"[yellow]Warning: Could not list findings in {region}: "
@@ -934,39 +2465,75 @@ def collect_access_analyzer_findings(
                 )
                 continue
             for finding in findings or []:
-                totals["findings"] += 1
+                grants.append(finding)
 
-                classification = finding["classification"]
-                if classification == "public":
-                    totals["public"] += 1
-                    public_findings.append(finding)
-                elif classification == "trusted":
-                    totals["trusted"] += 1
-                elif classification == "vendor":
-                    totals["vendors"] += 1
-                else:
-                    totals["unknown"] += 1
+    before = len(grants)
+    grants, dupes = dedupe_access_analyzer_grants(grants)
+    findings_by_type = {}
+    public_findings = []
+    seen_owners = set()
+    analyzed_ats = []
+    for finding in grants:
+        if finding.get("analyzed_at"):
+            analyzed_ats.append(str(finding["analyzed_at"]))
+        if finding.get("is_public") or finding.get("classification") == "public":
+            public_findings.append(finding)
+        if finding.get("owner_account") or finding.get("resource_owner"):
+            seen_owners.add(
+                finding.get("owner_account") or finding.get("resource_owner")
+            )
+        findings_by_type.setdefault(finding["resource_type"], []).append(finding)
 
-                if finding.get("missing_external_id"):
-                    totals["missing_external_id"] += 1
-                    missing_external_id.append(finding)
+    current_account_id = restrict_to_owner or next(iter(account_aliases), "")
+    analyzer_notes = enrich_aa_iam_role_conditions(
+        session, grants, current_account_id
+    )
+    if dupes:
+        analyzer_notes.append(
+            f"Removed {dupes} duplicate Access Analyzer finding(s) for the same "
+            "resource and principal (IAM is global; ACCOUNT + ORGANIZATION "
+            f"analyzers overlapped). {before} raw findings, {len(grants)} unique."
+        )
+    # Recompute leftover lists after GetRole enrichment.
+    missing_external_id = [g for g in grants if g.get("missing_external_id")]
+    missing_oidc = [g for g in grants if g.get("missing_oidc_subject")]
 
-                if finding.get("resource_owner"):
-                    seen_owners.add(finding["resource_owner"])
-
-                findings_by_type.setdefault(
-                    finding["resource_type"], []
-                ).append(finding)
-
+    totals = totals_from_grants(grants)
+    totals["regions"] = len(analyzers)
     totals["owner_accounts"] = len(seen_owners)
+
+    if analyzed_ats:
+        analyzer_notes.append(f"Newest finding analyzedAt: {max(analyzed_ats)}")
+    else:
+        analyzer_notes.append(
+            "No analyzedAt timestamps on findings. If analyzers were just created, "
+            "ACTIVE does not mean the first scan has finished (~20 minutes)."
+        )
+    if dropped_other_owners:
+        analyzer_notes.append(
+            f"Dropped {dropped_other_owners} ORGANIZATION-analyzer finding(s) "
+            "owned by other accounts (default inventory is this account; pass "
+            "--scope organization for the whole org)."
+        )
+    if any(a.get("type") == "ORGANIZATION" for a in analyzers.values()) and restrict_to_owner:
+        analyzer_notes.append(
+            "An ORGANIZATION analyzer was used in at least one region. Sibling "
+            "accounts are in that analyzer's zone of trust and will not appear "
+            "as external findings there. Prefer an ACCOUNT analyzer per region "
+            "for a this-account inventory."
+        )
 
     return {
         "by_resource_type": findings_by_type,
         "missing_external_id": missing_external_id,
+        "missing_oidc_subject": missing_oidc,
         "public_findings": public_findings,
         "totals": totals,
         "analyzers": analyzers,
         "owner_accounts": sorted(seen_owners),
+        "grants": grants,
+        "analyzer_notes": analyzer_notes,
+        "dropped_other_owners": dropped_other_owners,
     }
 
 
@@ -979,13 +2546,9 @@ def _classify_aa_finding(
     trusted_accounts: dict[str, dict[str, Any]],
     account_aliases: dict[str, str],
     org_accounts: dict[str, dict[str, Any]],
-) -> dict[str, Any]:
-    """Normalize and classify a single Access Analyzer finding.
-
-    Public findings short-circuit ahead of the principal-based classification
-    because Access Analyzer reports ``isPublic == True`` with an empty or
-    wildcard principal map.
-    """
+    our_organization_id: str | None = None,
+) -> dict[str, Any] | None:
+    """Normalize one Access Analyzer finding into a grant row."""
     resource_type = raw.get("resourceType", "Unknown")
     resource = raw.get("resource", "")
     resource_owner = raw.get("resourceOwnerAccount", "")
@@ -994,166 +2557,103 @@ def _classify_aa_finding(
     condition = raw.get("condition") or {}
     finding_id = raw.get("id", "")
     principal = raw.get("principal") or {}
+    analyzed_at = raw.get("analyzedAt")
+    analyzed_at_s = str(analyzed_at) if analyzed_at else ""
 
-    principal_accounts = _principal_account_ids(principal)
-    external_principal = principal_accounts[0] if principal_accounts else ""
-
-    classification = "unknown"
-    vendor_info: dict[str, Any] | None = None
-    trusted_info: dict[str, Any] | None = None
-
+    parsed: dict[str, Any]
     if is_public:
-        classification = "public"
-    elif external_principal:
-        if external_principal in trusted_accounts:
-            classification = "trusted"
-            trusted_info = trusted_accounts[external_principal]
-        elif external_principal in account_to_vendor:
-            classification = "vendor"
-            vendor_info = account_to_vendor[external_principal]
-    else:
-        # No AWS account principal (e.g. federated, service or canonical user).
-        # Treat as unknown so it surfaces in the report.
-        classification = "unknown"
-
-    owner_label = ""
-    if resource_owner:
-        owner_label = resource_owner
-        if resource_owner in org_accounts:
-            owner_label = f"{resource_owner} ({org_accounts[resource_owner]['name']})"
-        elif resource_owner in account_aliases:
-            owner_label = f"{resource_owner} ({account_aliases[resource_owner]})"
-
-    principal_label = ""
-    if is_public:
-        principal_label = "Everyone (public)"
-    elif external_principal:
-        principal_label = external_principal
-        if external_principal in account_aliases:
-            principal_label = (
-                f"{external_principal} ({account_aliases[external_principal]})"
-            )
-    elif principal:
-        # Show the raw principal type so federated / service principals are visible.
+        parsed = parse_principal_value("Wildcard", "*")
+    elif isinstance(principal, dict) and "Federated" in principal:
+        parsed = parse_principal_value("Federated", str(principal.get("Federated") or ""))
+    elif isinstance(principal, dict) and "CanonicalUser" in principal:
+        parsed = parse_principal_value(
+            "CanonicalUser", str(principal.get("CanonicalUser") or "")
+        )
+    elif isinstance(principal, dict) and "AWS" in principal:
+        aws_val = principal.get("AWS") or ""
+        parsed = parse_principal_value(
+            "AWS", str(aws_val), our_organization_id=our_organization_id
+        )
+    elif isinstance(principal, dict) and principal:
         kind, value = next(iter(principal.items()))
-        principal_label = f"{kind}: {value}"
-
-    finding: dict[str, Any] = {
-        "id": finding_id,
-        "region": region,
-        "analyzer_type": analyzer_type,
-        "resource": resource,
-        "resource_type": resource_type,
-        "resource_owner": resource_owner,
-        "owner_label": owner_label,
-        "external_principal": external_principal,
-        "principal_label": principal_label,
-        "principal_raw": principal,
-        "is_public": is_public,
-        "actions": actions,
-        "condition": condition,
-        "classification": classification,
-        "vendor": vendor_info,
-        "trusted": trusted_info,
-    }
-
-    if resource_type == "AWS::IAM::Role" and not is_public and external_principal:
-        # Re-derive the confused-deputy signal from AA's condition map.
-        if not _aa_finding_has_external_id(condition):
-            finding["missing_external_id"] = True
-
-    return finding
-
-
-def display_aa_results(report_data: dict[str, Any]) -> None:
-    """Render the Access Analyzer findings to the console with rich."""
-    totals = report_data["totals"]
-    analyzers = report_data["analyzers"]
-    by_type = report_data["by_resource_type"]
-
-    console.print(
-        Panel(
-            f"[bold]Access Analyzer Summary[/bold]\n"
-            f"[blue]Regions analyzed:[/blue] {totals['regions']}\n"
-            f"[blue]Owner accounts seen:[/blue] {totals['owner_accounts']}\n"
-            f"[green]Trusted findings:[/green] {totals['trusted']}\n"
-            f"[cyan]Known vendor findings:[/cyan] {totals['vendors']}\n"
-            f"[yellow]Unknown principal findings:[/yellow] {totals['unknown']}\n"
-            f"[red]Public access findings:[/red] {totals['public']}\n"
-            f"[red]IAM roles missing ExternalId:[/red] {totals['missing_external_id']}\n"
-            f"[bold]Total findings:[/bold] {totals['findings']}",
-            title="AWS Trustline (Access Analyzer)",
-            box=box.ROUNDED,
+        parsed = parse_principal_value(
+            kind if kind in ("AWS", "Federated", "CanonicalUser") else "AWS",
+            str(value),
+            our_organization_id=our_organization_id,
         )
+    else:
+        parsed = parse_principal_value("AWS", "")
+
+    current_account_id = next(iter(account_aliases), "") or resource_owner
+    grant = grant_from_parsed_principal(
+        parsed,
+        statement={"Condition": condition} if condition else None,
+        resource=resource,
+        resource_type=resource_type,
+        mechanism="access_analyzer",
+        trusted_accounts=trusted_accounts,
+        account_to_vendor=account_to_vendor,
+        current_account_id=current_account_id,
+        region=region,
+        owner_account=resource_owner,
+        owner_label=_owner_label(resource_owner, account_aliases, org_accounts),
+        actions=list(actions) if isinstance(actions, list) else [],
+        our_organization_id=our_organization_id,
     )
+    if grant is None:
+        return None
 
-    if not by_type:
-        console.print(
-            "[green]No active external-access findings reported by any analyzer.[/green]"
+    if is_public:
+        grant["is_public"] = True
+        grant["classification"] = "public"
+        grant["principal_label"] = "Everyone (*)"
+
+    if resource_type == "AWS::IAM::Role" and not grant["is_public"] and grant.get("principal_kind") == "aws_account":
+        grant["missing_external_id"] = should_flag_missing_external_id(
+            resource_type=resource_type,
+            mechanism="access_analyzer",
+            parsed={
+                "kind": grant.get("principal_kind"),
+                "is_public": grant.get("is_public"),
+            },
+            classification=grant.get("classification") or "unknown",
+            resource=resource,
+            condition=condition if isinstance(condition, dict) else {},
         )
-        return
 
+    if grant.get("principal_kind") == "federated":
+        raw_fed = ""
+        if isinstance(principal, dict):
+            raw_fed = str(principal.get("Federated") or next(iter(principal.values()), ""))
+        gaps = oidc_condition_gaps(raw_fed, condition)
+        grant["oidc_gaps"] = gaps
+        grant["missing_oidc_subject"] = bool(gaps)
+
+    grant.update(
+        {
+            "id": finding_id,
+            "analyzer_type": analyzer_type,
+            "analyzed_at": analyzed_at_s,
+            "resource_owner": resource_owner,
+            "external_principal": grant.get("principal_account_id") or "",
+            "condition": condition if isinstance(condition, dict) else {},
+        }
+    )
+    return grant
+
+
+def display_aa_results(report_data: dict[str, Any], coverage: dict[str, Any] | None = None) -> None:
+    """Print analyzer identity lines; grant tables come from display_grants."""
+    analyzers = report_data.get("analyzers") or {}
     for region, analyzer in analyzers.items():
+        created = analyzer.get("created_at") or ""
+        extra = f", created {created}" if created else ""
         console.print(
             f"[dim]Analyzer in {region}: {analyzer['name']} "
-            f"({analyzer['type']})[/dim]"
+            f"({analyzer['type']}{extra})[/dim]"
         )
-
-    for resource_type in sorted(by_type.keys()):
-        items = by_type[resource_type]
-        label = AA_RESOURCE_TYPE_LABELS.get(resource_type, resource_type)
-        table = Table(title=f"{label} ({len(items)} finding(s))", box=box.ROUNDED)
-        table.add_column("Resource", style="cyan", overflow="fold")
-        table.add_column("Owner", style="blue")
-        table.add_column("External principal", style="yellow")
-        table.add_column("Classification", style="green")
-        table.add_column("Region", style="dim")
-        for f in items:
-            classification = f["classification"]
-            display = classification
-            if classification == "vendor" and f["vendor"]:
-                display = f"vendor: {f['vendor']['name']}"
-            elif classification == "trusted" and f["trusted"]:
-                display = f"trusted: {f['trusted']['name']}"
-            elif classification == "public":
-                display = "[bold red]public[/bold red]"
-            table.add_row(
-                _short_resource(f["resource"]),
-                f["owner_label"] or "-",
-                f["principal_label"] or "-",
-                display,
-                f["region"],
-            )
-        console.print(table)
-
-    if report_data["missing_external_id"]:
-        table = Table(
-            title="IAM Roles Missing ExternalId Condition (Confused Deputy Risk)",
-            box=box.ROUNDED,
-        )
-        table.add_column("Role", style="red", overflow="fold")
-        table.add_column("Owner", style="blue")
-        table.add_column("External principal", style="yellow")
-        table.add_column("Region", style="dim")
-        for f in report_data["missing_external_id"]:
-            table.add_row(
-                _short_resource(f["resource"]),
-                f["owner_label"] or "-",
-                f["principal_label"] or "-",
-                f["region"],
-            )
-        console.print(table)
-
-
-def _short_resource(arn_or_name: str) -> str:
-    """Trim an ARN to its last path segment for compact console rendering."""
-    if not arn_or_name:
-        return ""
-    if "/" in arn_or_name:
-        return arn_or_name.split("/")[-1]
-    if ":" in arn_or_name:
-        return arn_or_name.split(":")[-1]
-    return arn_or_name
+    for note in (coverage or {}).get("analyzer_notes") or report_data.get("analyzer_notes") or []:
+        console.print(f"[yellow]{note}[/yellow]")
 
 
 # ---------------------------------------------------------------------------
@@ -1270,6 +2770,9 @@ a:hover { color: var(--accent); }
 .kpi-sub { font-size: 11px; color: var(--text-dim); margin-top: 6px; }
 .kpi.danger { border-color: var(--accent-border); }
 .kpi.danger .kpi-value { color: var(--accent-text); }
+.kpi.kpi-filter { cursor: pointer; }
+.kpi.kpi-filter:hover { border-color: var(--border-strong); }
+.kpi.kpi-filter.danger:hover { border-color: var(--accent); }
 .section {
   border: 1px solid var(--border);
   border-radius: 8px;
@@ -1351,6 +2854,11 @@ tbody tr:hover { background: rgba(39, 39, 42, 0.5); }
   font-size: 13px;
 }
 .callout strong { color: var(--accent-text); }
+.callout.info {
+  background: rgba(96, 165, 250, 0.10);
+  border-color: rgba(96, 165, 250, 0.35);
+}
+.callout.info strong { color: var(--info); }
 .tags { display: flex; flex-wrap: wrap; gap: 4px; }
 .tag {
   font-family: var(--mono); font-size: 11px;
@@ -1363,6 +2871,77 @@ tbody tr:hover { background: rgba(39, 39, 42, 0.5); }
 }
 .resource-cell .arn { color: var(--text); font-weight: 500; }
 .resource-cell .region { color: var(--text-dim); font-size: 11px; margin-top: 2px; }
+.filter-bar {
+  display: flex; flex-wrap: wrap; gap: 8px;
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg);
+}
+.filter-bar button {
+  font-family: var(--mono);
+  font-size: 10px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 0.08em;
+  background: transparent;
+  color: var(--text-muted);
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  padding: 4px 10px;
+  cursor: pointer;
+}
+.filter-bar button:hover { color: var(--text); }
+.filter-bar button.active {
+  color: var(--text);
+  border-color: var(--accent);
+}
+.filter-bar .export-group { margin-left: auto; display: flex; gap: 8px; }
+.filter-bar input[type="search"] {
+  font-family: var(--mono);
+  font-size: 12px;
+  background: var(--bg-elev);
+  color: var(--text);
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  padding: 4px 10px;
+  min-width: 220px;
+  flex: 1 1 180px;
+  max-width: 320px;
+}
+.filter-bar input[type="search"]::placeholder { color: var(--text-dim); }
+button.expand {
+  font-family: var(--mono);
+  font-size: 10px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 0.08em;
+  background: transparent;
+  color: var(--accent-text);
+  border: 1px solid var(--accent-border);
+  border-radius: 4px;
+  padding: 2px 8px;
+  cursor: pointer;
+  margin-right: 8px;
+}
+button.expand[aria-expanded="true"] { color: var(--text); }
+tr.party-detail td {
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+  padding: 0 20px 20px;
+}
+.party-detail-inner { padding-top: 8px; }
+.party-detail-inner h3 {
+  font-family: var(--mono);
+  font-size: 11px; font-weight: 700;
+  text-transform: uppercase; letter-spacing: 0.12em;
+  color: var(--text-muted);
+  margin: 16px 0 8px;
+}
+.party-detail-inner p, .party-detail-inner li {
+  font-size: 13px; color: var(--text);
+  max-width: 72ch;
+}
+.party-detail-inner ul { margin: 0; padding-left: 18px; }
+.party-detail-inner a { color: var(--info); }
+.grant-mini { width: 100%; margin-top: 8px; }
+.grant-mini th, .grant-mini td { padding: 8px 10px; font-size: 12px; }
+tbody tr.party-row:hover { background: rgba(39, 39, 42, 0.5); }
 .footer {
   padding: 32px 0 48px;
   color: var(--text-dim);
@@ -1372,6 +2951,38 @@ tbody tr:hover { background: rgba(39, 39, 42, 0.5); }
   margin-top: 32px;
 }
 .footer a { color: var(--text-muted); }
+details.coverage {
+  margin: 40px 0 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-elev);
+}
+details.coverage > summary {
+  cursor: pointer;
+  list-style: none;
+  padding: 16px 20px;
+  font-family: var(--mono);
+  font-size: 13px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.15em;
+  color: var(--text-muted);
+}
+details.coverage > summary::-webkit-details-marker { display: none; }
+details.coverage > summary::after {
+  content: "Show";
+  float: right;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  color: var(--text-dim);
+}
+details.coverage[open] > summary::after { content: "Hide"; }
+details.coverage[open] > summary {
+  border-bottom: 1px solid var(--border);
+}
+details.coverage .coverage-body { padding: 8px 20px 20px; }
+details.coverage .section { margin: 16px 0 0; }
+details.coverage .callout { margin: 16px 0 0; }
 """
 
 
@@ -1389,10 +3000,22 @@ def _html_pill(label: str, kind: str = "") -> str:
     return f'<span class="{klass}">{_h(label)}</span>'
 
 
+def _party_pill_kind(classification: str) -> str:
+    return {
+        "public": "danger",
+        "unknown": "warn",
+        "vendor": "vendor",
+        "federated": "info",
+        "trusted": "success",
+    }.get(classification, "")
+
+
 def _html_classification_pill(finding: dict[str, Any]) -> str:
     classification = finding["classification"]
     if classification == "public":
         return _html_pill("public", "danger")
+    if classification == "federated":
+        return _html_pill(finding.get("principal_label") or "federated", "info")
     if classification == "trusted":
         name = finding.get("trusted", {}).get("name", "trusted") if finding.get("trusted") else "trusted"
         return _html_pill(f"trusted: {name}", "success")
@@ -1405,11 +3028,13 @@ def _html_classification_pill(finding: dict[str, Any]) -> str:
         if first_source:
             return f'<a href="{_h(first_source)}" target="_blank" rel="noopener noreferrer">{pill}</a>'
         return pill
+    if classification == "blocked_public":
+        return _html_pill("blocked by BPA", "warn")
     return _html_pill("unknown", "warn")
 
 
 def _html_principal_cell(finding: dict[str, Any]) -> str:
-    if finding["is_public"]:
+    if finding.get("is_public"):
         return '<span class="dim mono">Everyone (public)</span>'
     label = finding.get("principal_label") or ""
     if not label:
@@ -1420,10 +3045,14 @@ def _html_principal_cell(finding: dict[str, Any]) -> str:
 def _html_resource_cell(finding: dict[str, Any]) -> str:
     arn = finding.get("resource", "")
     region = finding.get("region", "")
+    label = grant_resource_label(finding)
+    rtype = finding.get("resource_type") or ""
+    type_line = " ".join(p for p in (rtype, region) if p)
     return (
         '<div class="resource-cell">'
-        f'<div class="arn">{_h(arn) or "-"}</div>'
-        f'<div class="region">{_h(region)}</div>'
+        f'<div class="arn">{_h(label) or "-"}</div>'
+        f'<div class="region">{_h(type_line)}</div>'
+        f'<div class="region">{_h(arn)}</div>'
         "</div>"
     )
 
@@ -1439,16 +3068,164 @@ def _html_actions_cell(actions: list[str]) -> str:
     return f'<div class="tags">{tags}</div>'
 
 
-def _render_kpi(label: str, value: Any, sub: str = "", danger: bool = False) -> str:
+def _render_kpi(
+    label: str,
+    value: Any,
+    sub: str = "",
+    danger: bool = False,
+    filter_class: str | None = None,
+) -> str:
     klass = "kpi danger" if danger else "kpi"
+    attrs = ""
+    if filter_class is not None:
+        klass += " kpi-filter"
+        attrs = (
+            f' data-filter="{_h(filter_class)}" role="button" tabindex="0" '
+            'title="Filter inventory by this classification"'
+        )
     sub_html = f'<div class="kpi-sub">{_h(sub)}</div>' if sub else ""
     return (
-        f'<div class="{klass}">'
+        f'<div class="{klass}"{attrs}>'
         f'<div class="kpi-label">{_h(label)}</div>'
         f'<div class="kpi-value">{_h(value)}</div>'
         f"{sub_html}"
         "</div>"
     )
+
+
+_INVENTORY_FILTER_ORDER = ("unknown", "public", "vendor", "federated", "trusted")
+
+
+def _inventory_filter_bar(parties: list[dict[str, Any]]) -> str:
+    present = {p.get("classification") or "unknown" for p in parties}
+    buttons = [
+        '<button type="button" data-filter="all" class="active">All</button>'
+    ]
+    for classification in _INVENTORY_FILTER_ORDER:
+        if classification in present:
+            buttons.append(
+                f'<button type="button" data-filter="{_h(classification)}">'
+                f"{_h(classification)}</button>"
+            )
+    return (
+        '<div class="filter-bar" id="class-filter" role="toolbar" '
+        'aria-label="Filter by classification">'
+        f"{''.join(buttons)}"
+        '<input type="search" id="party-search" placeholder="Search principals and resources" '
+        'aria-label="Search principals and resources">'
+        '<span class="export-group">'
+        '<button type="button" id="export-csv">Export CSV</button>'
+        '<button type="button" id="export-md">Export Markdown</button>'
+        "</span></div>"
+    )
+
+
+_PARTY_INVENTORY_COLUMNS = [
+    "Principal",
+    "Name source",
+    "Classification",
+    "Grants",
+    "Mechanisms",
+    "Resources",
+]
+
+
+def _party_search_haystack(party: dict[str, Any]) -> str:
+    bits = [
+        party.get("name") or "",
+        party.get("classification") or "",
+        party.get("name_source_label") or "",
+        " ".join(party.get("mechanisms") or []),
+        _party_resource_summary(party, limit=50),
+    ]
+    for grant in party.get("grants") or []:
+        bits.append(grant.get("resource") or "")
+        bits.append(grant.get("resource_type") or "")
+        bits.append(grant_resource_label(grant))
+    return " ".join(bits).lower()
+
+
+def _party_grant_detail_rows(party: dict[str, Any]) -> str:
+    rows: list[str] = []
+    for grant in party.get("grants") or []:
+        url = aws_console_url(grant)
+        console = (
+            f'<a href="{_h(url)}" target="_blank" rel="noopener noreferrer">console</a>'
+            if url
+            else '<span class="dim">—</span>'
+        )
+        flags = leftover_flags(grant)
+        flag_html = (
+            "".join(f'<span class="tag">{_h(flag)}</span>' for flag in flags)
+            if flags
+            else '<span class="dim">—</span>'
+        )
+        cond = condition_summary(grant)
+        rows.append(
+            "<tr>"
+            f"<td class=\"mono\">{_h(grant.get('resource') or '')}</td>"
+            f"<td class=\"muted\">{_h(grant.get('resource_type') or '')}</td>"
+            f"<td class=\"muted\">{_h(grant.get('region') or '')}</td>"
+            f"<td class=\"muted\">{_h(MECHANISM_LABELS.get(grant.get('mechanism') or '', grant.get('mechanism') or ''))}</td>"
+            f"<td>{_html_actions_cell(grant.get('actions') or [])}</td>"
+            f"<td class=\"mono muted\">{_h(cond) if cond else '—'}</td>"
+            f"<td><div class=\"tags\">{flag_html}</div></td>"
+            f"<td>{console}</td>"
+            "</tr>"
+        )
+    if not rows:
+        return (
+            '<tr><td colspan="8" class="muted">No grant rows for this principal.</td></tr>'
+        )
+    return "".join(rows)
+
+
+def _party_detail_html(party: dict[str, Any], party_id: str) -> str:
+    fixes = party_fixes(party)
+    fix_items = "".join(f"<li>{_h(line)}</li>" for line in fixes) or (
+        "<li>Remove or restrict this principal on the listed resources.</li>"
+    )
+    return (
+        f'<tr class="party-detail" id="{_h(party_id)}-detail" hidden data-party="{_h(party_id)}">'
+        f'<td colspan="{len(_PARTY_INVENTORY_COLUMNS)}">'
+        '<div class="party-detail-inner">'
+        "<h3>Why this classification</h3>"
+        f"<p>{_h(classification_reason(party))}</p>"
+        "<h3>How to fix</h3>"
+        f"<ul>{fix_items}</ul>"
+        "<h3>Resources involved</h3>"
+        '<table class="grant-mini"><thead><tr>'
+        "<th>Resource</th><th>Type</th><th>Region</th><th>Mechanism</th>"
+        "<th>Actions</th><th>Condition</th><th>Flags</th><th></th>"
+        "</tr></thead><tbody>"
+        f"{_party_grant_detail_rows(party)}"
+        "</tbody></table>"
+        "</div></td></tr>"
+    )
+
+
+def _party_inventory_rows(parties: list[dict[str, Any]]) -> str:
+    chunks: list[str] = []
+    for index, party in enumerate(parties, start=1):
+        party_id = f"party-{index}"
+        klass = party.get("classification") or "unknown"
+        chunks.append(
+            f'<tr class="party-row" id="{_h(party_id)}" '
+            f'data-class="{_h(klass)}" data-search="{_h(_party_search_haystack(party))}">'
+            "<td>"
+            f'<button type="button" class="expand" aria-expanded="false" '
+            f'aria-controls="{_h(party_id)}-detail">Details</button>'
+            f"{_h(party['name'])}"
+            "</td>"
+            f"<td class=\"muted\">{_h(party['name_source_label'])}</td>"
+            f"<td>{_html_pill(klass, _party_pill_kind(klass))}</td>"
+            f"<td>{party['grant_count']}</td>"
+            f"<td class=\"muted\">{_h(', '.join(party['mechanisms']))}</td>"
+            f"<td class=\"muted\">{_h(_party_resource_summary(party))}</td>"
+            "</tr>"
+        )
+        chunks.append(_party_detail_html(party, party_id))
+    return "".join(chunks)
 
 
 def _render_section(
@@ -1459,6 +3236,8 @@ def _render_section(
     subtitle: str = "",
     empty_message: str = "",
     neutral: bool = False,
+    table_id: str = "",
+    toolbar_html: str = "",
 ) -> str:
     header_class = "section-header neutral" if neutral else "section-header"
     sub_html = f'<div class="section-sub">{_h(subtitle)}</div>' if subtitle else ""
@@ -1466,9 +3245,11 @@ def _render_section(
         body = f'<div class="section-body empty">{_h(empty_message or "No findings.")}</div>'
     else:
         header_cells = "".join(f"<th>{_h(c)}</th>" for c in columns)
+        tid = f' id="{_h(table_id)}"' if table_id else ""
         body = (
+            f"{toolbar_html}"
             '<div class="section-body">'
-            f'<table><thead><tr>{header_cells}</tr></thead><tbody>{rows_html}</tbody></table>'
+            f"<table{tid}><thead><tr>{header_cells}</tr></thead><tbody>{rows_html}</tbody></table>"
             "</div>"
         )
     return (
@@ -1482,7 +3263,18 @@ def _render_section(
     )
 
 
-def _html_document(*, title: str, header_html: str, body_html: str) -> str:
+def _html_document(
+    *,
+    title: str,
+    header_html: str,
+    body_html: str,
+    export_csv: str = "",
+    export_md: str = "",
+) -> str:
+    export_json = json.dumps(
+        {"csv": export_csv, "md": export_md},
+        ensure_ascii=False,
+    ).replace("<", "\\u003c")
     return (
         "<!DOCTYPE html>\n"
         '<html lang="en">\n<head>\n'
@@ -1498,6 +3290,75 @@ def _html_document(*, title: str, header_html: str, body_html: str) -> str:
         '<main class="container">\n'
         f"{body_html}\n"
         "</main>\n"
+        f'<script type="application/json" id="trustline-export">{export_json}</script>\n'
+        "<script>"
+        "(function(){"
+        'var table=document.getElementById("inventory-table");'
+        'var bar=document.getElementById("class-filter");'
+        "function download(name,text,mime){"
+        "var blob=new Blob([text],{type:mime});"
+        "var a=document.createElement('a');"
+        "a.href=URL.createObjectURL(blob);a.download=name;a.click();"
+        "setTimeout(function(){URL.revokeObjectURL(a.href);},1000);}"
+        "try{"
+        'var exp=JSON.parse(document.getElementById("trustline-export").textContent);'
+        'var csvBtn=document.getElementById("export-csv");'
+        'var mdBtn=document.getElementById("export-md");'
+        "if(csvBtn&&exp.csv){csvBtn.addEventListener('click',function(){"
+        "download('trustline-inventory.csv',exp.csv,'text/csv;charset=utf-8');});}"
+        "if(mdBtn&&exp.md){mdBtn.addEventListener('click',function(){"
+        "download('trustline-inventory.md',exp.md,'text/markdown;charset=utf-8');});}"
+        "}catch(e){}"
+        "if(!table)return;"
+        "var currentFilter='all';"
+        "var query='';"
+        "function applyView(){"
+        "if(bar){bar.querySelectorAll('button[data-filter]').forEach(function(b){"
+        "b.classList.toggle('active',b.getAttribute('data-filter')===currentFilter);});}"
+        "table.querySelectorAll('tbody tr.party-row').forEach(function(row){"
+        "var show=(currentFilter==='all'||row.getAttribute('data-class')===currentFilter);"
+        "if(show&&query){"
+        "var hay=row.getAttribute('data-search')||'';"
+        "show=hay.indexOf(query)>=0;}"
+        "row.style.display=show?'':'none';"
+        "var detail=row.nextElementSibling;"
+        "if(detail&&detail.classList.contains('party-detail')){"
+        "if(!show){detail.hidden=true;detail.style.display='none';"
+        "var btn=row.querySelector('.expand');"
+        "if(btn)btn.setAttribute('aria-expanded','false');}"
+        "}"
+        "});}"
+        "function applyFilter(filter){currentFilter=filter||'all';applyView();}"
+        "if(bar){bar.addEventListener('click',function(e){"
+        "var btn=e.target.closest('button[data-filter]');if(!btn)return;"
+        "applyFilter(btn.getAttribute('data-filter')||'all');});}"
+        'var search=document.getElementById("party-search");'
+        "if(search){search.addEventListener('input',function(){"
+        "query=(search.value||'').toLowerCase().trim();applyView();});}"
+        "document.querySelectorAll('.kpi[data-filter]').forEach(function(kpi){"
+        "kpi.addEventListener('click',function(){applyFilter(kpi.getAttribute('data-filter')||'all');});"
+        "kpi.addEventListener('keydown',function(e){"
+        "if(e.key==='Enter'||e.key===' '){e.preventDefault();applyFilter(kpi.getAttribute('data-filter')||'all');}"
+        "});});"
+        "table.addEventListener('click',function(e){"
+        "var btn=e.target.closest('button.expand');if(!btn)return;"
+        "var row=btn.closest('tr');"
+        "var detail=row&&row.nextElementSibling;"
+        "if(!detail||!detail.classList.contains('party-detail'))return;"
+        "var wasHidden=detail.hidden;"
+        "detail.hidden=!wasHidden;"
+        "detail.style.display=wasHidden?'':'none';"
+        "btn.setAttribute('aria-expanded',wasHidden?'true':'false');"
+        "});"
+        "if(location.hash){"
+        "var target=document.getElementById(location.hash.slice(1));"
+        "if(target&&target.classList.contains('party-row')){"
+        "var openBtn=target.querySelector('.expand');"
+        "if(openBtn)openBtn.click();"
+        "target.scrollIntoView({block:'start'});"
+        "}}"
+        "})();"
+        "</script>\n"
         '<footer class="footer container">'
         'Generated by <a href="https://github.com/zoph-io/aws-trustline" target="_blank" rel="noopener noreferrer">AWS Trustline</a>'
         ' &middot; design inspired by <a href="https://iamtrail.com" target="_blank" rel="noopener noreferrer">iamtrail.com</a>'
@@ -1507,17 +3368,254 @@ def _html_document(*, title: str, header_html: str, body_html: str) -> str:
     )
 
 
-def _aa_meta_row(report_data: dict[str, Any], account_label: str, scope: str) -> str:
-    analyzers = report_data["analyzers"]
-    regions = ", ".join(analyzers.keys()) if analyzers else "-"
-    items = [
-        f"<span><strong>Account/Org:</strong> {_h(account_label)}</span>",
-        f"<span><strong>Scope:</strong> {_h(scope)}</span>",
-        f"<span><strong>Regions:</strong> {_h(regions)}</span>",
-        f"<span><strong>Owner accounts:</strong> {report_data['totals']['owner_accounts']}</span>",
-        f"<span><strong>Generated:</strong> {_h(datetime.now().strftime('%Y-%m-%d %H:%M:%S'))}</span>",
-    ]
-    return f'<div class="meta meta-row">{"".join(items)}</div>'
+def _render_coverage_html(coverage: dict[str, Any]) -> str:
+    scanned_rows = "".join(
+        f"<tr><td>{_h(item['surface'])}</td><td class=\"muted\">{_h(item['detail'])}</td></tr>"
+        for item in coverage.get("scanned") or []
+    )
+    skipped_rows = "".join(
+        f"<tr><td>{_h(item['surface'])}</td><td class=\"muted\">{_h(item['detail'])}</td></tr>"
+        for item in coverage.get("not_scanned") or []
+    )
+    notes = "".join(
+        f"<li>{_h(note)}</li>" for note in coverage.get("analyzer_notes") or []
+    )
+    notes_html = f"<ul>{notes}</ul>" if notes else ""
+    n_scanned = len(coverage.get("scanned") or [])
+    n_skip = len(coverage.get("not_scanned") or [])
+    scanned_table = _render_section(
+        "Scanned",
+        scanned_rows,
+        ["Surface", "Detail"],
+        empty_message="Nothing was scanned.",
+        neutral=True,
+    )
+    aa_blurb = ""
+    if coverage.get("backend") == "access_analyzer":
+        aa_blurb = (
+            " Analyzer status ACTIVE is not scan-complete; first scans can take "
+            "~20 minutes."
+        )
+    return (
+        '<details class="coverage">'
+        f"<summary>Coverage — {n_scanned} scanned, {n_skip} not scanned</summary>"
+        '<div class="coverage-body">'
+        '<div class="callout info"><strong>The inventory only covers scanned surfaces.</strong>'
+        f"{aa_blurb}"
+        f"{notes_html}</div>"
+        + scanned_table
+        + _render_section(
+            "Not scanned",
+            skipped_rows,
+            ["Surface", "Why"],
+            subtitle="Out of scope, skipped, or collector errors",
+        )
+        + "</div></details>"
+    )
+
+
+def _grant_table_rows(items: list[dict[str, Any]], *, show_owner: bool) -> str:
+    return "".join(
+        "<tr>"
+        f"<td>{_html_resource_cell(g)}</td>"
+        + (f'<td><span class="mono">{_h(g.get("owner_label") or "-")}</span></td>' if show_owner else "")
+        + f"<td>{_html_principal_cell(g)}</td>"
+        f"<td>{_html_classification_pill(g)}</td>"
+        f"<td class=\"muted\">{_h(MECHANISM_LABELS.get(g.get('mechanism') or '', g.get('mechanism') or '-'))}</td>"
+        f"<td>{_html_actions_cell(g.get('actions') or [])}</td>"
+        "</tr>"
+        for g in items
+    )
+
+
+def generate_html_report(
+    grants: list[dict[str, Any]],
+    coverage: dict[str, Any],
+    *,
+    account_aliases: dict[str, str],
+    scope: str = "account",
+    output_dir: str = ".",
+    org_error: str | None = None,
+    badge: str = "Policy scanner",
+) -> str:
+    """Write HTML: inventory by principal, leftover flags, coverage appendix."""
+    totals = totals_from_grants(grants)
+    parties = parties_from_grants(grants)
+    ptotals = party_totals(parties)
+    current_account_id = (
+        list(account_aliases.keys())[0] if account_aliases else "unknown"
+    )
+    current_account_alias = account_aliases.get(current_account_id, current_account_id)
+
+    if scope == "organization":
+        identity_slug = "org"
+        owner_count = len({g.get("owner_account") for g in grants if g.get("owner_account")})
+        identity_label = f"AWS Organization ({owner_count} owner accounts)"
+    else:
+        identity_slug = current_account_id
+        identity_label = f"{current_account_id} ({current_account_alias})"
+
+    report_file = _report_filename(output_dir, identity_slug, "html")
+    show_owner = scope == "organization"
+
+    header_html = (
+        f'<div class="nav-meta">{_h(identity_label)}'
+        f' &middot; {_h(scope)} scope</div>'
+    )
+    hero_html = (
+        '<section class="hero"><div>'
+        '<h1>Trustline<span style="color:var(--accent)">_</span>'
+        f'<span class="badge">{_h(badge)}</span></h1>'
+        '<p>Current external access on this account. 12-digit account IDs are '
+        'looked up in the '
+        '<a href="https://github.com/fwdcloudsec/known_aws_accounts" target="_blank" rel="noopener noreferrer">fwd:cloudsec</a> '
+        'dataset. Unresolved IDs were not in that list, your YAML, or Organizations.</p>'
+        '<div class="meta meta-row">'
+        f"<span><strong>Account/Org:</strong> {_h(identity_label)}</span>"
+        f"<span><strong>Parties:</strong> {len(parties)}</span>"
+        f"<span><strong>Grants:</strong> {totals['findings']}</span>"
+        f"<span><strong>Generated:</strong> {_h(datetime.now().strftime('%Y-%m-%d %H:%M:%S'))}</span>"
+        "</div></div></section>"
+    )
+    kpis_html = (
+        '<div class="kpis">'
+        + _render_kpi(
+            "External parties",
+            ptotals["parties"],
+            "Grouped by account ID or issuer",
+            filter_class="all",
+        )
+        + _render_kpi(
+            "Unknown parties",
+            ptotals["unknown"],
+            "Looked up, no name",
+            danger=ptotals["unknown"] > 0,
+            filter_class="unknown",
+        )
+        + _render_kpi(
+            "Public parties",
+            ptotals["public"],
+            "Currently shared with *",
+            danger=ptotals["public"] > 0,
+            filter_class="public",
+        )
+        + _render_kpi(
+            "Vendor parties",
+            ptotals["vendor"],
+            "fwd:cloudsec + AWS aliases",
+            filter_class="vendor",
+        )
+        + _render_kpi(
+            "Trusted parties",
+            ptotals["trusted"],
+            "Org + YAML + CloudFront",
+            filter_class="trusted",
+        )
+        + _render_kpi(
+            "Federated parties",
+            ptotals["federated"],
+            "OIDC / SAML / Cognito",
+            filter_class="federated",
+        )
+        + _render_kpi("Missing ExternalId", totals["missing_external_id"], "Confused deputy (grants)", danger=totals["missing_external_id"] > 0)
+        + _render_kpi("OIDC gaps", totals["missing_oidc_subject"], "Missing sub/aud (grants)", danger=totals["missing_oidc_subject"] > 0)
+        + "</div>"
+    )
+
+    columns = ["Resource"]
+    if show_owner:
+        columns.append("Owner")
+    columns.extend(["Principal", "Classification", "Mechanism", "Actions"])
+
+    def section(title: str, items: list[dict[str, Any]], empty: str, *, subtitle: str = "", neutral: bool = False) -> str:
+        if not items:
+            return ""
+        return _render_section(
+            title,
+            _grant_table_rows(items, show_owner=show_owner),
+            columns,
+            subtitle=subtitle or f"{len(items)} grant(s)",
+            empty_message=empty,
+            neutral=neutral,
+        )
+
+    party_rows = _party_inventory_rows(parties)
+    if parties:
+        inventory_html = _render_section(
+            "External access by principal",
+            party_rows,
+            _PARTY_INVENTORY_COLUMNS,
+            subtitle=(
+                f"{len(parties)} external part"
+                f"{'y' if len(parties) == 1 else 'ies'}. "
+                "Open Details for why, resources, and how to fix. "
+                "Filter by class, search, or click a party KPI. Export CSV or Markdown."
+            ),
+            empty_message="No current external access in scanned surfaces.",
+            neutral=True,
+            table_id="inventory-table",
+            toolbar_html=_inventory_filter_bar(parties),
+        )
+    else:
+        inventory_html = (
+            '<div class="callout info"><strong>No current external access</strong> '
+            "in scanned surfaces.</div>"
+        )
+
+    parts: list[str] = []
+    if org_error:
+        parts.append(
+            '<div class="callout"><strong>AWS Organizations:</strong> '
+            f"{_h(org_error)}</div>"
+        )
+    parts.append(inventory_html)
+    parts.append(
+        section(
+            "OIDC trusts missing sub/aud",
+            [g for g in grants if g.get("missing_oidc_subject")],
+            "No GitHub/GitLab trusts missing subject or audience conditions.",
+        )
+    )
+    parts.append(
+        section(
+            "IAM roles missing ExternalId",
+            [g for g in grants if g.get("missing_external_id")],
+            "No cross-account roles missing sts:ExternalId.",
+        )
+    )
+    parts.append(
+        section(
+            "Never-expiring service-specific credentials",
+            [g for g in grants if g.get("never_expires")],
+            "No active never-expiring service-specific credentials.",
+        )
+    )
+    parts.append(
+        section(
+            "Policy allows everyone; Block Public Access denies it",
+            [g for g in grants if g.get("blocked_by_bpa")],
+            "No BPA-blocked public policies.",
+            subtitle="Allow * is in the policy but GetBucketPolicyStatus is not public.",
+            neutral=True,
+        )
+    )
+
+    parts.append(_render_coverage_html(coverage))
+
+    body_html = hero_html + kpis_html + "\n".join(part for part in parts if part)
+    inventory_md, _blocked = _inventory_markdown(grants)
+    export_md = inventory_md + party_details_markdown(parties)
+    with open(report_file, "w") as fh:
+        fh.write(
+            _html_document(
+                title=f"Trustline Report - {identity_label}",
+                header_html=header_html,
+                body_html=body_html,
+                export_csv=inventory_csv(grants),
+                export_md=export_md,
+            )
+        )
+    return report_file
 
 
 def generate_html_report_aa(
@@ -1528,390 +3626,44 @@ def generate_html_report_aa(
     scope: str,
     output_dir: str = ".",
 ) -> str:
-    """Write an Access Analyzer findings report as a self-contained HTML file."""
-    totals = report_data["totals"]
-    by_type = report_data["by_resource_type"]
-
-    current_account_id = (
-        list(account_aliases.keys())[0] if account_aliases else "unknown"
+    """Lambda-compatible wrapper around the unified HTML writer."""
+    grants = list(report_data.get("grants") or [])
+    coverage = report_data.get("coverage") or build_coverage(
+        backend="access_analyzer",
+        scanned=[{"surface": "IAM Access Analyzer", "detail": "external-access findings"}],
+        analyzer_notes=report_data.get("analyzer_notes") or [],
     )
-    current_account_alias = account_aliases.get(current_account_id, current_account_id)
-
-    if scope == "organization":
-        identity_slug = "org"
-        identity_label = f"AWS Organization ({totals['owner_accounts']} accounts)"
-    else:
-        identity_slug = current_account_id
-        identity_label = f"{current_account_id} ({current_account_alias})"
-
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    report_file = os.path.join(
-        output_dir, f"trustline_report_{identity_slug}_{timestamp}.html"
+    return generate_html_report(
+        grants,
+        coverage,
+        account_aliases=account_aliases,
+        scope=scope,
+        output_dir=output_dir,
+        badge="Access Analyzer",
     )
-
-    show_owner_column = scope == "organization"
-
-    header_html = (
-        f'<div class="nav-meta">{_h(identity_label)}'
-        f' &middot; {_h(scope)} scope</div>'
-    )
-
-    hero_html = (
-        '<section class="hero"><div>'
-        '<h1>Trustline<span style="color:var(--accent)">_</span>'
-        '<span class="badge">Access Analyzer</span></h1>'
-        '<p>Provable external-access findings, classified against the '
-        '<a href="https://github.com/fwdcloudsec/known_aws_accounts" target="_blank" rel="noopener noreferrer">fwd:cloudsec</a> '
-        'vendor dataset.</p>'
-        f"{_aa_meta_row(report_data, identity_label, scope)}"
-        "</div></section>"
-    )
-
-    kpis_html = (
-        '<div class="kpis">'
-        + _render_kpi("Trusted", totals["trusted"], "From Org + YAML allow-list")
-        + _render_kpi("Known vendors", totals["vendors"], "From fwd:cloudsec dataset")
-        + _render_kpi("Unknown", totals["unknown"], "External principals to review", danger=totals["unknown"] > 0)
-        + _render_kpi("Public", totals["public"], "Resources open to the world", danger=totals["public"] > 0)
-        + _render_kpi(
-            "Missing ExternalId",
-            totals["missing_external_id"],
-            "IAM roles at confused-deputy risk",
-            danger=totals["missing_external_id"] > 0,
-        )
-        + _render_kpi("Total findings", totals["findings"], f"Across {totals['regions']} region(s)")
-        + "</div>"
-    )
-
-    sections_html_parts: list[str] = []
-
-    if report_data["public_findings"]:
-        rows = "".join(
-            "<tr>"
-            f"<td>{AA_RESOURCE_TYPE_LABELS.get(f['resource_type'], f['resource_type'])}</td>"
-            f"<td>{_html_resource_cell(f)}</td>"
-            + (f'<td><span class="mono">{_h(f["owner_label"] or "-")}</span></td>' if show_owner_column else "")
-            + f"<td>{_html_actions_cell(f.get('actions', []))}</td>"
-            "</tr>"
-            for f in report_data["public_findings"]
-        )
-        columns = ["Type", "Resource"]
-        if show_owner_column:
-            columns.append("Owner")
-        columns.append("Actions")
-        sections_html_parts.append(
-            _render_section(
-                "Public access",
-                rows,
-                columns,
-                subtitle=f"{len(report_data['public_findings'])} resource(s) shared with everyone",
-            )
-        )
-
-    if report_data["missing_external_id"]:
-        rows = "".join(
-            "<tr>"
-            f"<td>{_html_resource_cell(f)}</td>"
-            + (f'<td><span class="mono">{_h(f["owner_label"] or "-")}</span></td>' if show_owner_column else "")
-            + f"<td>{_html_principal_cell(f)}</td>"
-            f"<td>{_html_classification_pill(f)}</td>"
-            "</tr>"
-            for f in report_data["missing_external_id"]
-        )
-        columns = ["IAM Role"]
-        if show_owner_column:
-            columns.append("Owner")
-        columns.extend(["External principal", "Classification"])
-        sections_html_parts.append(
-            _render_section(
-                "IAM roles missing ExternalId condition",
-                rows,
-                columns,
-                subtitle="Cross-account trust without sts:ExternalId condition (confused deputy risk)",
-            )
-        )
-
-    for resource_type in sorted(by_type.keys()):
-        items = by_type[resource_type]
-        label = AA_RESOURCE_TYPE_LABELS.get(resource_type, resource_type)
-        rows = "".join(
-            "<tr>"
-            f"<td>{_html_resource_cell(f)}</td>"
-            + (f'<td><span class="mono">{_h(f["owner_label"] or "-")}</span></td>' if show_owner_column else "")
-            + f"<td>{_html_principal_cell(f)}</td>"
-            f"<td>{_html_classification_pill(f)}</td>"
-            f"<td>{_html_pill('public', 'danger') if f['is_public'] else '<span class=\"dim\">-</span>'}</td>"
-            f"<td>{_html_actions_cell(f.get('actions', []))}</td>"
-            "</tr>"
-            for f in items
-        )
-        columns = ["Resource"]
-        if show_owner_column:
-            columns.append("Owner")
-        columns.extend(["External principal", "Classification", "Public", "Actions"])
-        sections_html_parts.append(
-            _render_section(
-                f"{label}",
-                rows,
-                columns,
-                subtitle=f"{len(items)} finding(s)",
-                neutral=True,
-            )
-        )
-
-    if not sections_html_parts:
-        sections_html_parts.append(
-            '<div class="callout">No active external-access findings reported by any analyzer in scope. '
-            "Either no resources are shared externally, or the analyzers have not yet produced findings "
-            "(findings are generated asynchronously after analyzer creation).</div>"
-        )
-
-    body_html = hero_html + kpis_html + "\n".join(sections_html_parts)
-
-    with open(report_file, "w") as f:
-        f.write(
-            _html_document(
-                title=f"Trustline Report - {identity_label}",
-                header_html=header_html,
-                body_html=body_html,
-            )
-        )
-
-    return report_file
-
-
-def generate_html_report_legacy(
-    iam_known_vendors: dict[str, list[str]],
-    iam_unknown_accounts: dict[str, list[str]],
-    iam_trusted_entities: dict[str, dict[str, Any]],
-    iam_vulnerable_roles: dict[str, dict[str, Any]],
-    s3_known_vendors: dict[str, list[str]],
-    s3_unknown_accounts: dict[str, list[str]],
-    s3_trusted_entities: dict[str, dict[str, Any]],
-    account_aliases: dict[str, str],
-    *,
-    output_dir: str = ".",
-    org_error: str | None = None,
-) -> str:
-    """Write the regex-backend findings as a self-contained HTML report.
-
-    Mirrors the structure of :func:`generate_report` (the Markdown writer) but
-    rendered with the same iamtrail.com design system used by the Access
-    Analyzer report so users get a consistent look across backends.
-    """
-    current_account_id = (
-        list(account_aliases.keys())[0] if account_aliases else "unknown"
-    )
-    current_account_alias = account_aliases.get(current_account_id, current_account_id)
-
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    report_file = os.path.join(
-        output_dir, f"trustline_report_{current_account_id}_{timestamp}.html"
-    )
-
-    total_trusted = len(iam_trusted_entities) + len(s3_trusted_entities)
-    total_known = len(iam_known_vendors) + len(s3_known_vendors)
-    total_unknown = len(iam_unknown_accounts) + len(s3_unknown_accounts)
-    total_vulnerable = len(iam_vulnerable_roles)
-
-    header_html = (
-        f'<div class="nav-meta">{_h(current_account_id)} ({_h(current_account_alias)})</div>'
-    )
-
-    hero_html = (
-        '<section class="hero"><div>'
-        '<h1>Trustline<span style="color:var(--accent)">_</span>'
-        '<span class="badge">Policy scanner</span></h1>'
-        '<p>Map and audit third-party trust in IAM role trust policies and S3 bucket policies.</p>'
-        '<div class="meta meta-row">'
-        f"<span><strong>Account:</strong> {_h(current_account_id)} ({_h(current_account_alias)})</span>"
-        f"<span><strong>Generated:</strong> {_h(datetime.now().strftime('%Y-%m-%d %H:%M:%S'))}</span>"
-        "</div>"
-        "</div></section>"
-    )
-
-    kpis_html = (
-        '<div class="kpis">'
-        + _render_kpi("Trusted entities", total_trusted)
-        + _render_kpi("Known vendors", total_known)
-        + _render_kpi("Unknown accounts", total_unknown, danger=total_unknown > 0)
-        + _render_kpi("Missing ExternalId", total_vulnerable, "Confused deputy risk", danger=total_vulnerable > 0)
-        + "</div>"
-    )
-
-    sections: list[str] = []
-
-    if org_error:
-        sections.append(
-            '<div class="callout"><strong>AWS Organizations:</strong> '
-            f"could not list accounts ({_h(org_error)}). "
-            "Trusted-entity matches may be incomplete; ensure the caller has "
-            "<code>organizations:ListAccounts</code>.</div>"
-        )
-
-    sections.append("<h2 style=\"font-family:var(--mono);margin:32px 0 8px;\">IAM Roles</h2>")
-
-    rows = "".join(
-        "<tr>"
-        f"<td>{_h(entity)}</td>"
-        f"<td>{_html_pill(data['source'])}</td>"
-        f"<td><div class=\"tags\">{''.join(f'<span class=\"tag\">{_h(r)}</span>' for r in data['roles'])}</div></td>"
-        "</tr>"
-        for entity, data in iam_trusted_entities.items()
-    )
-    sections.append(
-        _render_section(
-            "Trusted entities with IAM role access",
-            rows,
-            ["Entity", "Source", "Roles"],
-            empty_message="No trusted entities found in IAM role trust policies.",
-            neutral=True,
-        )
-    )
-
-    rows = "".join(
-        "<tr>"
-        f"<td>{_h(vendor)}</td>"
-        f"<td><div class=\"tags\">{''.join(f'<span class=\"tag\">{_h(r)}</span>' for r in roles)}</div></td>"
-        "</tr>"
-        for vendor, roles in iam_known_vendors.items()
-    )
-    sections.append(
-        _render_section(
-            "Known vendors with IAM role access",
-            rows,
-            ["Vendor", "Roles"],
-            empty_message="No known vendors found in IAM role trust policies.",
-            neutral=True,
-        )
-    )
-
-    rows = "".join(
-        "<tr>"
-        f"<td><span class=\"mono\">{_h(account)}</span></td>"
-        f"<td><div class=\"tags\">{''.join(f'<span class=\"tag\">{_h(r)}</span>' for r in roles)}</div></td>"
-        "</tr>"
-        for account, roles in iam_unknown_accounts.items()
-    )
-    sections.append(
-        _render_section(
-            "Unknown AWS accounts with IAM role access",
-            rows,
-            ["Account", "Roles"],
-            empty_message="No unknown AWS accounts found in IAM role trust policies.",
-        )
-    )
-
-    rows = "".join(
-        "<tr>"
-        f"<td>{_h(entity)}</td>"
-        f"<td>{_html_pill(data['source'])}</td>"
-        f"<td><div class=\"tags\">{''.join(f'<span class=\"tag\">{_h(r)}</span>' for r in data['roles'])}</div></td>"
-        "</tr>"
-        for entity, data in iam_vulnerable_roles.items()
-    )
-    sections.append(
-        _render_section(
-            "IAM roles missing ExternalId condition",
-            rows,
-            ["Entity", "Source", "Vulnerable roles"],
-            subtitle="Cross-account roles at risk of the confused deputy problem",
-            empty_message="No vulnerable IAM roles found.",
-        )
-    )
-
-    sections.append("<h2 style=\"font-family:var(--mono);margin:32px 0 8px;\">S3 Buckets</h2>")
-
-    rows = "".join(
-        "<tr>"
-        f"<td>{_h(entity)}</td>"
-        f"<td>{_html_pill(data['source'])}</td>"
-        f"<td><div class=\"tags\">{''.join(f'<span class=\"tag\">{_h(b)}</span>' for b in data['buckets'])}</div></td>"
-        "</tr>"
-        for entity, data in s3_trusted_entities.items()
-    )
-    sections.append(
-        _render_section(
-            "Trusted entities with S3 bucket access",
-            rows,
-            ["Entity", "Source", "Buckets"],
-            empty_message="No trusted entities found in S3 bucket policies.",
-            neutral=True,
-        )
-    )
-
-    rows = "".join(
-        "<tr>"
-        f"<td>{_h(vendor)}</td>"
-        f"<td><div class=\"tags\">{''.join(f'<span class=\"tag\">{_h(b)}</span>' for b in buckets)}</div></td>"
-        "</tr>"
-        for vendor, buckets in s3_known_vendors.items()
-    )
-    sections.append(
-        _render_section(
-            "Known vendors with S3 bucket access",
-            rows,
-            ["Vendor", "Buckets"],
-            empty_message="No known vendors found in S3 bucket policies.",
-            neutral=True,
-        )
-    )
-
-    rows = "".join(
-        "<tr>"
-        f"<td><span class=\"mono\">{_h(account)}</span></td>"
-        f"<td><div class=\"tags\">{''.join(f'<span class=\"tag\">{_h(b)}</span>' for b in buckets)}</div></td>"
-        "</tr>"
-        for account, buckets in s3_unknown_accounts.items()
-    )
-    sections.append(
-        _render_section(
-            "Unknown AWS accounts with S3 bucket access",
-            rows,
-            ["Account", "Buckets"],
-            empty_message="No unknown AWS accounts found in S3 bucket policies.",
-        )
-    )
-
-    body_html = hero_html + kpis_html + "\n".join(sections)
-
-    with open(report_file, "w") as f:
-        f.write(
-            _html_document(
-                title=f"Trustline Report - {current_account_id}",
-                header_html=header_html,
-                body_html=body_html,
-            )
-        )
-
-    return report_file
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="trustline",
-        description="AWS Trustline - Map and audit third-party trust relationships in your AWS account.",
+        description=(
+            "AWS Trustline - Map current external access in your AWS account "
+            "and name the vendor when the account ID is known."
+        ),
     )
     parser.add_argument(
         "-V", "--version",
         action="version",
         version=f"%(prog)s {__version__}",
     )
-    parser.add_argument(
-        "-p", "--profile",
-        help="AWS profile name to use for authentication",
-    )
-    parser.add_argument(
-        "-r", "--region",
-        help="AWS region to use (overrides profile/env default)",
-    )
+    parser.add_argument("-p", "--profile", help="AWS profile name to use for authentication")
+    parser.add_argument("-r", "--region", help="AWS region (overrides profile/env default)")
     parser.add_argument(
         "-o", "--output",
         default=DEFAULT_OUTPUT_DIR,
         help=(
             f"Output directory for report files (default: {DEFAULT_OUTPUT_DIR}/). "
-            "Each run writes a timestamped, account/org-scoped file. Existing "
-            "reports are never overwritten."
+            "Each run writes a timestamped file. Existing reports are never overwritten."
         ),
     )
     parser.add_argument(
@@ -1919,75 +3671,245 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_TRUSTED_ACCOUNTS_FILE,
         help=f"Path to trusted accounts YAML file (default: {DEFAULT_TRUSTED_ACCOUNTS_FILE})",
     )
+    parser.add_argument("--skip-iam", action="store_true", help="Skip IAM role trust policies")
+    parser.add_argument("--skip-s3", action="store_true", help="Skip S3 bucket policies")
     parser.add_argument(
-        "--skip-s3",
+        "--skip-resource-policies",
         action="store_true",
-        help="Skip S3 bucket policy analysis (regex backend only)",
+        help=(
+            "Skip KMS, SNS, SQS, Lambda, Lambda layer, Secrets Manager, ECR, "
+            "EFS, and DynamoDB resource policies, plus EBS/RDS snapshot shares "
+            "(policy scanner only; Access Analyzer already covers these types). "
+            "Also skips KMS ListGrants on the policy scanner."
+        ),
     )
+    parser.add_argument("--skip-ram", action="store_true", help="Skip RAM resource shares")
+    parser.add_argument("--skip-ami", action="store_true", help="Skip AMI launch permissions")
+    parser.add_argument("--skip-ssm", action="store_true", help="Skip SSM document shares")
     parser.add_argument(
-        "--skip-iam",
+        "--skip-credentials",
         action="store_true",
-        help="Skip IAM role trust policy analysis (regex backend only)",
+        help="Skip IAM service-specific credentials / long-lived API keys",
     )
-    parser.add_argument(
+    backend_group = parser.add_mutually_exclusive_group()
+    backend_group.add_argument(
         "--use-access-analyzer",
         action="store_true",
         help=(
-            "Use IAM Access Analyzer findings instead of the built-in regex "
-            "scanner (covers all AA-supported resource types: IAM, S3, KMS, "
-            "Lambda, SNS, SQS, Secrets Manager, EFS, EBS/RDS snapshots, ECR, "
-            "DynamoDB)"
+            "Require IAM Access Analyzer (fail if none exists). Default is to "
+            "use analyzers when found and walk IAM/S3 policies otherwise. "
+            "RAM, AMI, SSM, credentials, EventBridge, Glue, OpenSearch, and "
+            "PrivateLink still run unless skipped."
         ),
+    )
+    backend_group.add_argument(
+        "--policy-scanner",
+        action="store_true",
+        help=(
+            "Walk IAM role trusts and S3 bucket policies even if Access Analyzer "
+            "exists. Public S3 rows are checked with GetBucketPolicyStatus."
+        ),
+    )
+    parser.add_argument(
+        "--wait-for-analyzer",
+        action="store_true",
+        help=(
+            "Poll Access Analyzer until ACTIVE finding counts stabilize. "
+            "Applies when analyzers are used (default hybrid or --use-access-analyzer). "
+            "ACTIVE is not scan-complete; first scans can take ~20 minutes."
+        ),
+    )
+    parser.add_argument(
+        "--wait-timeout",
+        type=int,
+        default=DEFAULT_WAIT_TIMEOUT,
+        help=f"Seconds to wait with --wait-for-analyzer (default: {DEFAULT_WAIT_TIMEOUT})",
     )
     parser.add_argument(
         "--scope",
         choices=["auto", "account", "organization"],
         default="auto",
         help=(
-            "Access Analyzer scope: 'account' uses ACCOUNT analyzers, "
-            "'organization' uses ORGANIZATION analyzers (run from the org "
-            "management or AA delegated-admin account), 'auto' prefers an "
-            "ORGANIZATION analyzer when present (default: auto)"
+            "Access Analyzer scope: 'account' (this account), 'organization' "
+            "(run from the org management or AA delegated-admin account), or "
+            "'auto' (default: prefer ACCOUNT analyzers so the inventory is this "
+            "account; ORGANIZATION only if no ACCOUNT analyzer exists)"
         ),
     )
     region_group = parser.add_mutually_exclusive_group()
     region_group.add_argument(
         "--regions",
-        help=(
-            "Comma-separated regions for the Access Analyzer backend "
-            "(e.g. us-east-1,eu-west-1). Defaults to the session region."
-        ),
+        help="Comma-separated regions for RAM, AMI, SSM, AA, resource policies, EventBridge, Glue, OpenSearch, PrivateLink, and snapshots",
     )
     region_group.add_argument(
         "--all-regions",
         action="store_true",
-        help=(
-            "Enumerate every enabled region via ec2:DescribeRegions "
-            "and query an external analyzer in each (Access Analyzer backend only)"
-        ),
+        help="Enumerate every enabled region via ec2:DescribeRegions",
     )
     parser.add_argument(
         "--format",
-        choices=["html", "md", "both"],
+        choices=["html", "md", "json", "csv", "both"],
         default=None,
         help=(
-            "Report format(s) to write. Default: 'html' for the Access "
-            "Analyzer backend, 'md' for the regex backend."
+            "Report format(s). json is the machine-readable inventory (parties + grants). "
+            "csv is one row per grant with why/how-to-fix. both writes html and markdown. "
+            "HTML also embeds CSV and Markdown export buttons. Default: html when Access "
+            "Analyzer is used, md for the policy scanner."
         ),
     )
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Show full error tracebacks for debugging",
-    )
+    parser.add_argument("--verbose", action="store_true", help="Show full error tracebacks")
     return parser
 
 
-def _resolve_format(args: argparse.Namespace) -> str:
-    """Default ``--format`` per backend (HTML for AA, Markdown for the regex)."""
+def _resolve_format(args: argparse.Namespace, using_access_analyzer: bool) -> str:
     if args.format:
         return args.format
-    return "html" if args.use_access_analyzer else "md"
+    return "html" if using_access_analyzer else "md"
+
+
+def _try_resolve_regions(session: boto3.Session, args: argparse.Namespace) -> list[str]:
+    try:
+        return resolve_regions(session, args)
+    except (ValueError, RuntimeError) as e:
+        console.print(f"[yellow]Warning: could not resolve regions: {e}[/yellow]")
+        return []
+
+
+def generate_json_report(
+    grants: list[dict[str, Any]],
+    coverage: dict[str, Any],
+    *,
+    account_aliases: dict[str, str],
+    scope: str = "account",
+    output_dir: str = ".",
+    org_error: str | None = None,
+    badge: str = "",
+) -> str:
+    """Write a machine-readable inventory for SIEM / pipeline use."""
+    current_account_id = (
+        list(account_aliases.keys())[0] if account_aliases else "unknown"
+    )
+    current_account_alias = account_aliases.get(current_account_id, current_account_id)
+    slug = "org" if scope == "organization" else current_account_id
+    parties = parties_from_grants(grants)
+    payload = {
+        "tool": "aws-trustline",
+        "version": __version__,
+        "generated_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+        "badge": badge,
+        "scope": scope,
+        "account_id": current_account_id,
+        "account_alias": current_account_alias,
+        "org_error": org_error,
+        "totals": {
+            "grants": totals_from_grants(grants),
+            "parties": party_totals(parties),
+        },
+        "parties": [
+            {
+                "name": party["name"],
+                "account_id": party.get("account_id"),
+                "classification": party["classification"],
+                "name_source": party.get("name_source"),
+                "name_source_label": party.get("name_source_label"),
+                "grant_count": party["grant_count"],
+                "mechanisms": party["mechanisms"],
+                "resources": list(dict.fromkeys(party.get("resources") or [])),
+                "why": classification_reason(party),
+                "how_to_fix": party_fixes(party),
+            }
+            for party in parties
+        ],
+        "leftovers": {
+            "missing_oidc_subject": [
+                g for g in grants if g.get("missing_oidc_subject")
+            ],
+            "missing_external_id": [
+                g for g in grants if g.get("missing_external_id")
+            ],
+            "never_expires": [g for g in grants if g.get("never_expires")],
+            "blocked_by_bpa": [g for g in grants if g.get("blocked_by_bpa")],
+        },
+        "grants": grants,
+        "coverage": coverage,
+    }
+    report_file = _report_filename(output_dir, slug, "json")
+    with open(report_file, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2, default=str)
+        fh.write("\n")
+    return report_file
+
+
+def generate_csv_report(
+    grants: list[dict[str, Any]],
+    *,
+    account_aliases: dict[str, str],
+    scope: str = "account",
+    output_dir: str = ".",
+) -> str:
+    """Write one CSV row per grant, with classification reason and fix."""
+    current_account_id = (
+        list(account_aliases.keys())[0] if account_aliases else "unknown"
+    )
+    slug = "org" if scope == "organization" else current_account_id
+    report_file = _report_filename(output_dir, slug, "csv")
+    with open(report_file, "w", encoding="utf-8", newline="") as fh:
+        fh.write(inventory_csv(grants))
+    return report_file
+
+
+def _write_reports(
+    grants: list[dict[str, Any]],
+    coverage: dict[str, Any],
+    *,
+    args: argparse.Namespace,
+    account_aliases: dict[str, str],
+    output_format: str,
+    org_error: str | None,
+    scope: str,
+    badge: str,
+) -> None:
+    os.makedirs(args.output, exist_ok=True)
+    if output_format in ("md", "both"):
+        md_path = generate_markdown_report(
+            grants,
+            coverage,
+            account_aliases=account_aliases,
+            org_error=org_error,
+            output_dir=args.output,
+            identity_slug="org" if scope == "organization" else None,
+        )
+        console.print(f"\n[bold green]Markdown report: {md_path}[/bold green]")
+    if output_format in ("html", "both"):
+        html_path = generate_html_report(
+            grants,
+            coverage,
+            account_aliases=account_aliases,
+            scope=scope,
+            output_dir=args.output,
+            org_error=org_error,
+            badge=badge,
+        )
+        console.print(f"[bold green]HTML report: {html_path}[/bold green]")
+    if output_format == "json":
+        json_path = generate_json_report(
+            grants,
+            coverage,
+            account_aliases=account_aliases,
+            scope=scope,
+            output_dir=args.output,
+            org_error=org_error,
+            badge=badge,
+        )
+        console.print(f"[bold green]JSON report: {json_path}[/bold green]")
+    if output_format == "csv":
+        csv_path = generate_csv_report(
+            grants,
+            account_aliases=account_aliases,
+            scope=scope,
+            output_dir=args.output,
+        )
+        console.print(f"[bold green]CSV report: {csv_path}[/bold green]")
 
 
 def _run_access_analyzer_backend(
@@ -1998,25 +3920,27 @@ def _run_access_analyzer_backend(
     org_accounts: dict[str, dict[str, Any]],
     account_aliases: dict[str, str],
     output_format: str,
+    our_organization_id: str | None,
+    org_error: str | None,
+    analyzers: dict[str, dict[str, str]] | None = None,
 ) -> int:
-    """Drive the Access Analyzer pipeline: region resolve, discover, collect, render."""
     try:
         regions = resolve_regions(session, args)
     except (ValueError, RuntimeError) as e:
         console.print(f"[bold red]Error resolving regions: {e}[/bold red]")
         return 1
 
-    console.print(
-        f"[bold]Discovering external analyzers in {len(regions)} region(s) "
-        f"(scope: {args.scope})...[/bold]"
-    )
-    analyzers = find_external_analyzers(session, regions, args.scope)
+    if analyzers is None:
+        console.print(
+            f"[bold]Discovering external analyzers in {len(regions)} region(s) "
+            f"(scope: {args.scope})...[/bold]"
+        )
+        analyzers = find_external_analyzers(session, regions, args.scope)
 
     missing = [r for r in regions if r not in analyzers]
     if missing:
         console.print(
-            f"[yellow]No matching external analyzer in: "
-            f"{', '.join(missing)}[/yellow]"
+            f"[yellow]No matching external analyzer in: {', '.join(missing)}[/yellow]"
         )
 
     if not analyzers:
@@ -2025,18 +3949,11 @@ def _run_access_analyzer_backend(
             "[bold red]No external Access Analyzer found in any requested "
             "region.[/bold red]"
         )
-        console.print(
-            "[yellow]Create a free external-access analyzer with:[/yellow]"
-        )
+        console.print("[yellow]Create a free external-access analyzer with:[/yellow]")
         console.print(
             f"  [cyan]aws accessanalyzer create-analyzer "
             f"--analyzer-name trustline --type {scope_hint}[/cyan]"
         )
-        if args.scope in ("organization", "auto"):
-            console.print(
-                "  [dim](ORGANIZATION analyzers must be created from the org "
-                "management or AA delegated-admin account.)[/dim]"
-            )
         return 1
 
     for region, analyzer in analyzers.items():
@@ -2045,6 +3962,16 @@ def _run_access_analyzer_backend(
             f"{analyzer['name']}[/green]"
         )
 
+    wait_notes: list[str] = []
+    if args.wait_for_analyzer:
+        wait_notes = wait_for_analyzer_findings(
+            session, analyzers, timeout=max(1, args.wait_timeout)
+        )
+
+    current_account_id = next(iter(account_aliases), "")
+    restrict_to_owner = (
+        None if args.scope == "organization" else current_account_id or None
+    )
     report_data = collect_access_analyzer_findings(
         session=session,
         account_to_vendor=account_to_vendor,
@@ -2052,118 +3979,153 @@ def _run_access_analyzer_backend(
         account_aliases=account_aliases,
         org_accounts=org_accounts,
         analyzers=analyzers,
+        our_organization_id=our_organization_id,
+        restrict_to_owner=restrict_to_owner,
+    )
+    report_data["analyzer_notes"] = (
+        wait_notes + list(report_data.get("analyzer_notes") or [])
     )
 
-    display_aa_results(report_data)
+    kwargs = grant_collect_context(
+        account_to_vendor=account_to_vendor,
+        trusted_accounts=trusted_accounts,
+        current_account_id=current_account_id,
+        our_organization_id=our_organization_id,
+        account_aliases=account_aliases,
+        org_accounts=org_accounts,
+    )
+    extra, scanned, skipped = collect_optional_scanners(session, args, regions, kwargs)
+    grants = list(report_data.get("grants") or []) + extra
+    report_data["grants"] = grants
+    report_data["totals"] = totals_from_grants(grants)
+    report_data["totals"]["regions"] = len(analyzers)
+    report_data["totals"]["owner_accounts"] = len(report_data.get("owner_accounts") or [])
 
-    os.makedirs(args.output, exist_ok=True)
+    coverage = build_coverage(
+        backend="access_analyzer",
+        scanned=(
+            [{"surface": "IAM Access Analyzer external findings", "detail": ", ".join(analyzers)}]
+            + scanned
+        ),
+        skipped=skipped,
+        regions=regions,
+        all_regions=bool(args.all_regions),
+        analyzer_notes=report_data["analyzer_notes"],
+    )
+    report_data["coverage"] = coverage
 
-    effective_scope = args.scope
-    if effective_scope == "auto":
-        if any(a["type"] == "ORGANIZATION" for a in analyzers.values()):
-            effective_scope = "organization"
-        else:
-            effective_scope = "account"
+    display_aa_results(report_data, coverage)
+    display_grants(grants, coverage, account_aliases)
 
-    if output_format in ("html", "both"):
-        html_path = generate_html_report_aa(
-            report_data,
-            account_aliases=account_aliases,
-            org_accounts=org_accounts,
-            scope=effective_scope,
-            output_dir=args.output,
-        )
-        console.print(f"\n[bold green]HTML report: {html_path}[/bold green]")
-
-    if output_format in ("md", "both"):
-        console.print(
-            "[yellow]Note: Markdown output is not implemented for the Access "
-            "Analyzer backend yet; only HTML is produced.[/yellow]"
-        )
-
+    effective_scope = report_scope_label(args.scope)
+    _write_reports(
+        grants,
+        coverage,
+        args=args,
+        account_aliases=account_aliases,
+        output_format=output_format,
+        org_error=org_error,
+        scope=effective_scope,
+        badge="Access Analyzer",
+    )
     return 0
 
 
-def _run_regex_backend(
+def _run_policy_scanner(
     session: boto3.Session,
     args: argparse.Namespace,
     account_to_vendor: dict[str, dict[str, Any]],
     trusted_accounts: dict[str, dict[str, Any]],
+    org_accounts: dict[str, dict[str, Any]],
     account_aliases: dict[str, str],
     org_error: str | None,
     output_format: str,
+    our_organization_id: str | None,
 ) -> int:
-    """Drive the original IAM/S3 regex scanner pipeline."""
-    iam_known_vendors: dict = {}
-    iam_unknown_accounts: dict = {}
-    iam_trusted_entities: dict = {}
-    iam_vulnerable_roles: dict = {}
-
-    if not args.skip_iam:
-        (
-            iam_known_vendors,
-            iam_unknown_accounts,
-            iam_trusted_entities,
-            iam_vulnerable_roles,
-        ) = check_iam_role_trust_policies(
-            session, account_to_vendor, trusted_accounts, account_aliases
-        )
-
-    s3_known_vendors: dict = {}
-    s3_unknown_accounts: dict = {}
-    s3_trusted_entities: dict = {}
-
-    if not args.skip_s3:
-        s3_known_vendors, s3_unknown_accounts, s3_trusted_entities = (
-            check_s3_bucket_policies(
-                session, account_to_vendor, trusted_accounts, account_aliases
-            )
-        )
-
-    display_results(
-        iam_known_vendors,
-        iam_unknown_accounts,
-        iam_trusted_entities,
-        iam_vulnerable_roles,
-        s3_known_vendors,
-        s3_unknown_accounts,
-        s3_trusted_entities,
-        account_aliases,
+    current_account_id = next(iter(account_aliases), "")
+    kwargs = grant_collect_context(
+        account_to_vendor=account_to_vendor,
+        trusted_accounts=trusted_accounts,
+        current_account_id=current_account_id,
+        our_organization_id=our_organization_id,
+        account_aliases=account_aliases,
+        org_accounts=org_accounts,
     )
+    regions = _try_resolve_regions(session, args)
+    grants: list[dict[str, Any]] = []
+    scanned: list[dict[str, str]] = []
+    skipped: list[dict[str, str]] = []
 
-    os.makedirs(args.output, exist_ok=True)
+    if args.skip_iam:
+        skipped.append({"surface": "IAM role trust policies", "detail": "--skip-iam"})
+    else:
+        grants.extend(collect_iam_role_grants(session, **kwargs))
+        scanned.append({"surface": "IAM role trust policies", "detail": "this account"})
 
-    if output_format in ("md", "both"):
-        md_path = generate_report(
-            iam_known_vendors,
-            iam_unknown_accounts,
-            iam_trusted_entities,
-            iam_vulnerable_roles,
-            s3_known_vendors,
-            s3_unknown_accounts,
-            s3_trusted_entities,
-            account_aliases,
-            output_dir=args.output,
-            org_error=org_error,
+    if args.skip_s3:
+        skipped.append({"surface": "S3 bucket policies", "detail": "--skip-s3"})
+    else:
+        grants.extend(collect_s3_bucket_grants(session, **kwargs))
+        scanned.append({"surface": "S3 bucket policies", "detail": "this account"})
+
+    if getattr(args, "skip_resource_policies", False):
+        skipped.append(
+            {
+                "surface": (
+                    "KMS / SNS / SQS / Lambda / Lambda layer / Secrets / ECR / "
+                    "EFS / DynamoDB policies and EBS/RDS snapshot shares"
+                ),
+                "detail": "--skip-resource-policies",
+            }
         )
-        console.print(f"\n[bold green]Markdown report: {md_path}[/bold green]")
-
-    if output_format in ("html", "both"):
-        html_path = generate_html_report_legacy(
-            iam_known_vendors,
-            iam_unknown_accounts,
-            iam_trusted_entities,
-            iam_vulnerable_roles,
-            s3_known_vendors,
-            s3_unknown_accounts,
-            s3_trusted_entities,
-            account_aliases,
-            output_dir=args.output,
-            org_error=org_error,
+    else:
+        rp_grants, rp_scanned, rp_skipped = collect_resource_policy_grants(
+            session, regions, **kwargs
         )
-        console.print(f"[bold green]HTML report: {html_path}[/bold green]")
+        grants.extend(rp_grants)
+        scanned.extend(rp_scanned)
+        skipped.extend(rp_skipped)
 
+    extra, extra_scanned, extra_skipped = collect_optional_scanners(
+        session, args, regions, kwargs
+    )
+    grants.extend(extra)
+    scanned.extend(extra_scanned)
+    skipped.extend(extra_skipped)
+
+    coverage = build_coverage(
+        backend="policy_scanner",
+        scanned=scanned,
+        skipped=skipped,
+        regions=regions,
+        all_regions=bool(args.all_regions),
+    )
+    display_grants(grants, coverage, account_aliases)
+    _write_reports(
+        grants,
+        coverage,
+        args=args,
+        account_aliases=account_aliases,
+        output_format=output_format,
+        org_error=org_error,
+        scope="account",
+        badge="Policy scanner",
+    )
     return 0
+
+
+def _all_collectors_skipped(args: argparse.Namespace) -> bool:
+    extras = (
+        args.skip_ram
+        and args.skip_ami
+        and args.skip_ssm
+        and args.skip_credentials
+    )
+    if args.use_access_analyzer:
+        return extras
+    if getattr(args, "policy_scanner", False):
+        return extras and args.skip_iam and args.skip_s3 and args.skip_resource_policies
+    return False
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2173,19 +4135,17 @@ def main(argv: list[str] | None = None) -> int:
     if args.use_access_analyzer and (args.skip_iam or args.skip_s3):
         console.print(
             "[bold red]Error: --use-access-analyzer is mutually exclusive with "
-            "--skip-iam / --skip-s3.[/bold red]"
+            "--skip-iam / --skip-s3 (AA replaces those collectors).[/bold red]"
         )
         return 1
-
-    if not args.use_access_analyzer and (args.regions or args.all_regions):
+    if args.wait_for_analyzer and getattr(args, "policy_scanner", False):
         console.print(
-            "[bold red]Error: --regions / --all-regions require "
-            "--use-access-analyzer.[/bold red]"
+            "[bold red]Error: --wait-for-analyzer cannot be combined with "
+            "--policy-scanner.[/bold red]"
         )
         return 1
-
-    if not args.use_access_analyzer and args.skip_iam and args.skip_s3:
-        console.print("[bold red]Error: Cannot skip both IAM and S3 analysis.[/bold red]")
+    if _all_collectors_skipped(args):
+        console.print("[bold red]Error: every collector is skipped.[/bold red]")
         return 1
 
     session_kwargs: dict[str, str] = {}
@@ -2195,16 +4155,11 @@ def main(argv: list[str] | None = None) -> int:
         session_kwargs["region_name"] = args.region
     session = boto3.Session(**session_kwargs)
 
-    output_format = _resolve_format(args)
-
     try:
-        backend_label = "Access Analyzer" if args.use_access_analyzer else "Policy scanner"
         console.print(
             Panel(
                 "[bold cyan]AWS Trustline[/bold cyan]\n"
-                "Map and audit third-party trust relationships in your AWS account.\n"
-                f"[dim]Backend:[/dim] {backend_label}    "
-                f"[dim]Output:[/dim] {output_format}",
+                "Map current external access and name the vendor when the account is known.",
                 title="AWS Trustline",
                 box=box.ROUNDED,
             )
@@ -2218,15 +4173,62 @@ def main(argv: list[str] | None = None) -> int:
 
         console.print("[bold]Loading trusted AWS accounts...[/bold]")
         trusted_accounts, org_error = fetch_trusted_accounts(session, args.trusted_accounts)
-
-        # Keep the raw Org-only map for AA scope grouping/labels.
-        org_accounts: dict[str, dict[str, Any]] = {
+        org_accounts = {
             acct_id: meta
             for acct_id, meta in trusted_accounts.items()
             if meta.get("source") == "aws_org"
         }
-
+        our_organization_id = fetch_organization_id(session)
         account_aliases = get_account_aliases(session)
+
+        if getattr(args, "policy_scanner", False):
+            output_format = _resolve_format(args, False)
+            console.print(
+                f"[dim]Backend:[/dim] Policy scanner    [dim]Output:[/dim] {output_format}"
+            )
+            return _run_policy_scanner(
+                session=session,
+                args=args,
+                account_to_vendor=account_to_vendor,
+                trusted_accounts=trusted_accounts,
+                org_accounts=org_accounts,
+                account_aliases=account_aliases,
+                org_error=org_error,
+                output_format=output_format,
+                our_organization_id=our_organization_id,
+            )
+
+        regions = _try_resolve_regions(session, args)
+        analyzers: dict[str, dict[str, str]] = {}
+        if regions:
+            console.print(
+                f"[bold]Looking for external analyzers in {len(regions)} region(s) "
+                f"(scope: {args.scope})...[/bold]"
+            )
+            analyzers = find_external_analyzers(session, regions, args.scope)
+
+        if analyzers:
+            output_format = _resolve_format(args, True)
+            if not args.use_access_analyzer:
+                console.print(
+                    "[green]Access Analyzer found — using it for IAM/S3-class resources "
+                    "(effective access). Pass --policy-scanner to walk policies instead.[/green]"
+                )
+            console.print(
+                f"[dim]Backend:[/dim] Access Analyzer    [dim]Output:[/dim] {output_format}"
+            )
+            return _run_access_analyzer_backend(
+                session=session,
+                args=args,
+                account_to_vendor=account_to_vendor,
+                trusted_accounts=trusted_accounts,
+                org_accounts=org_accounts,
+                account_aliases=account_aliases,
+                output_format=output_format,
+                our_organization_id=our_organization_id,
+                org_error=org_error,
+                analyzers=analyzers,
+            )
 
         if args.use_access_analyzer:
             return _run_access_analyzer_backend(
@@ -2236,17 +4238,35 @@ def main(argv: list[str] | None = None) -> int:
                 trusted_accounts=trusted_accounts,
                 org_accounts=org_accounts,
                 account_aliases=account_aliases,
-                output_format=output_format,
+                output_format=_resolve_format(args, True),
+                our_organization_id=our_organization_id,
+                org_error=org_error,
+                analyzers={},
             )
 
-        return _run_regex_backend(
+        if args.wait_for_analyzer:
+            console.print(
+                "[yellow]--wait-for-analyzer ignored: no analyzer found; "
+                "walking IAM/S3 policies.[/yellow]"
+            )
+        output_format = _resolve_format(args, False)
+        console.print(
+            "[yellow]No external Access Analyzer in requested regions; "
+            "walking IAM/S3 policies.[/yellow]"
+        )
+        console.print(
+            f"[dim]Backend:[/dim] Policy scanner    [dim]Output:[/dim] {output_format}"
+        )
+        return _run_policy_scanner(
             session=session,
             args=args,
             account_to_vendor=account_to_vendor,
             trusted_accounts=trusted_accounts,
+            org_accounts=org_accounts,
             account_aliases=account_aliases,
             org_error=org_error,
             output_format=output_format,
+            our_organization_id=our_organization_id,
         )
 
     except KeyboardInterrupt:
@@ -2261,3 +4281,4 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+

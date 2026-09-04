@@ -17,7 +17,8 @@ Parameters:
       Access Analyzer scope. 'account' uses ACCOUNT analyzers (this account
       only); 'organization' uses ORGANIZATION analyzers (must be deployed in
       the org management or AA delegated-admin account); 'auto' prefers an
-      ORGANIZATION analyzer when present.
+      ACCOUNT analyzer when present (this-account inventory). ORGANIZATION is
+      used only when no ACCOUNT analyzer exists in that region.
 
   Regions:
     Type: String
@@ -167,6 +168,7 @@ Resources:
           REGIONS: !Ref Regions
           REPORT_BUCKET: !Ref ReportBucket
           ALERT_TOPIC_ARN: !If [EnableAlertEmail, !Ref AlertTopic, ""]
+          TRUSTLINE_CACHE_DIR: "/tmp/trustline-cache"
           # Rich auto-detects non-TTY but force plain output for CloudWatch.
           NO_COLOR: "1"
           PYTHONUNBUFFERED: "1"
@@ -185,8 +187,49 @@ Resources:
               Action:
                 - sts:GetCallerIdentity
                 - iam:ListAccountAliases
+                - iam:GetRole
+                - iam:ListServiceSpecificCredentials
                 - ec2:DescribeRegions
+                - ec2:DescribeImages
+                - ec2:DescribeImageAttribute
                 - organizations:ListAccounts
+                - organizations:DescribeOrganization
+              Resource: "*"
+            - Sid: RamShares
+              Effect: Allow
+              Action:
+                - ram:GetResourceShareAssociations
+                - ram:ListResourceSharePermissions
+                - ram:GetPermission
+              Resource: "*"
+            - Sid: EventBridgeBusPolicies
+              Effect: Allow
+              Action:
+                - events:ListEventBuses
+                - events:DescribeEventBus
+              Resource: "*"
+            - Sid: GlueCatalogPolicy
+              Effect: Allow
+              Action:
+                - glue:GetResourcePolicy
+              Resource: "*"
+            - Sid: OpenSearchDomainPolicies
+              Effect: Allow
+              Action:
+                - es:ListDomainNames
+                - es:DescribeDomain
+              Resource: "*"
+            - Sid: PrivateLinkAllowedPrincipals
+              Effect: Allow
+              Action:
+                - ec2:DescribeVpcEndpointServiceConfigurations
+                - ec2:DescribeVpcEndpointServicePermissions
+              Resource: "*"
+            - Sid: SsmDocumentShares
+              Effect: Allow
+              Action:
+                - ssm:ListDocuments
+                - ssm:DescribeDocumentPermission
               Resource: "*"
             - Sid: WriteReports
               Effect: Allow

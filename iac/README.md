@@ -1,10 +1,12 @@
 # AWS Trustline scheduled scanner (Lambda + EventBridge + S3)
 
-Deploy [AWS Trustline](../README.md) as a scheduled AWS Lambda. Findings from
-IAM Access Analyzer are classified against the
-[fwd:cloudsec](https://github.com/fwdcloudsec/known_aws_accounts) vendor
-dataset, rendered into a timestamped HTML report, uploaded to S3, and
-(optionally) summarized over SNS when anything warrants attention.
+Deploy [AWS Trustline](../README.md) as a scheduled AWS Lambda. Grant rows from
+IAM Access Analyzer (plus RAM / AMI / SSM / credentials / EventBridge / Glue / OpenSearch / PrivateLink) are classified against
+the [fwd:cloudsec](https://github.com/fwdcloudsec/known_aws_accounts) vendor
+dataset. The HTML report leads with an inventory grouped by principal (names
+from fwd:cloudsec / Organizations), ends with a collapsed coverage appendix,
+is uploaded to S3, and (optionally) summarized over SNS when leftover
+warrants attention.
 
 The Access Analyzer external-access tier is free, so this stack adds no
 analyzer costs. You only pay for Lambda invocations, CloudWatch Logs, S3
@@ -16,7 +18,7 @@ storage, and any optional SNS deliveries.
 flowchart LR
     Sched["EventBridge Schedule<br/>(cron / rate)"] --> Fn
     Fn["Lambda<br/>aws-trustline-scanner"] -->|list_analyzers<br/>list_findings| AA["IAM Access Analyzer<br/>(external access, free)"]
-    Fn -->|fetch_reference_data| Vendors["fwd:cloudsec dataset<br/>(GitHub raw)"]
+    Fn -->|fetch_reference_data| Vendors["fwd:cloudsec dataset<br/>(GitHub + local cache)"]
     Fn -->|list_accounts| Orgs[AWS Organizations]
     Fn -->|put_object| S3["S3<br/>report bucket"]
     Fn -->|publish if findings| SNS["SNS topic<br/>(optional)"]
@@ -96,7 +98,7 @@ deployment with daily scans at 06:00 UTC and no SNS alerting.
 
 | Parameter | Default | What it controls |
 |---|---|---|
-| `Scope` | `auto` | `auto` (prefers ORGANIZATION if present), `account`, or `organization` |
+| `Scope` | `auto` | `auto` (prefers ACCOUNT if present), `account`, or `organization` |
 | `Regions` | `all` | `all` (enumerate via `ec2:DescribeRegions`) or comma list `us-east-1,eu-west-1` |
 | `ScheduleExpression` | `cron(0 6 * * ? *)` | EventBridge cron or rate expression |
 | `ScheduleTimezone` | `UTC` | IANA timezone (e.g. `Europe/Paris`) |
@@ -126,7 +128,7 @@ aws s3 ls "s3://$(aws cloudformation describe-stacks \
     --output text)/reports/" --recursive
 ```
 
-A successful invoke returns:
+A successful invoke returns (numbers are placeholders):
 
 ```json
 {
@@ -134,14 +136,24 @@ A successful invoke returns:
   "scope": "organization",
   "regions": ["eu-west-1", "us-east-1"],
   "totals": {
-    "trusted": 10, "vendors": 0, "unknown": 9,
-    "public": 1, "missing_external_id": 6,
-    "findings": 28, "owner_accounts": 3
+    "trusted": 10,
+    "vendors": 0,
+    "federated": 4,
+    "unknown": 1,
+    "public": 1,
+    "missing_external_id": 0,
+    "missing_oidc_subject": 1,
+    "never_expires": 0,
+    "findings": 16,
+    "owner_accounts": 3,
+    "regions": 2
   },
   "report_key": "reports/2026/06/20/trustline_report_org_20260620_104108.html",
   "bucket": "aws-trustline-reportbucket-..."
 }
 ```
+
+SNS alerts when public, unknown, missing ExternalId, OIDC `sub`/`aud` gaps, or never-expiring credentials are non-zero.
 
 ## Update
 
@@ -189,8 +201,16 @@ The Lambda execution role is built inline in
 | `access-analyzer:GetFinding` | `*` (regional) | Future-proof for full-detail lookups |
 | `sts:GetCallerIdentity` | `*` | Identify the running account |
 | `iam:ListAccountAliases` | `*` | Friendlier names in the report |
+| `iam:ListServiceSpecificCredentials` | `*` | Long-lived API keys / service-specific credentials |
 | `ec2:DescribeRegions` | `*` | Enumerate enabled regions when `Regions=all` |
-| `organizations:ListAccounts` | `*` | Label org members in the report |
+| `ec2:DescribeImages` / `DescribeImageAttribute` | `*` | AMI launch permissions |
+| `ec2:DescribeVpcEndpointServiceConfigurations` / `DescribeVpcEndpointServicePermissions` | `*` | PrivateLink allowed principals |
+| `ram:GetResourceShareAssociations` / `ListResourceSharePermissions` / `GetPermission` | `*` | RAM resource shares |
+| `events:ListEventBuses` / `DescribeEventBus` | `*` | EventBridge bus policies |
+| `glue:GetResourcePolicy` | `*` | Glue Data Catalog resource policy |
+| `es:ListDomainNames` / `DescribeDomain` | `*` | OpenSearch domain access policies |
+| `ssm:ListDocuments` / `DescribeDocumentPermission` | `*` | SSM document shares |
+| `organizations:ListAccounts` / `DescribeOrganization` | `*` | Label org members; recognize this-org ARNs |
 | `s3:PutObject*` | `${ReportBucket}/*` | Upload generated HTML |
 | `sns:Publish` | `${AlertTopic}` | Alert on non-empty findings (only if `AlertEmail` set) |
 
@@ -209,8 +229,8 @@ multipart uploads after 7 days.
 - **Time the scan with a real timezone.** Set `ScheduleTimezone=Europe/Paris`
   and `ScheduleExpression=cron(0 7 * * ? *)` to scan at 07:00 local time
   every day across summer/winter time changes.
-- **Read a report locally.** The HTML report is self-contained (inline CSS,
-  no JS); just download from S3 and open in a browser:
+- **Read a report locally.** The HTML is self-contained (inline CSS and a small script for filters, Details panes, and CSV/Markdown export).
+  Leftover tables come first; coverage is a collapsed appendix at the bottom.
 
   ```bash
   aws s3 cp "s3://${BUCKET}/${KEY}" /tmp/trustline.html && open /tmp/trustline.html
@@ -242,6 +262,8 @@ iac/
 ├── samconfig.toml.sample    # `cp` and edit before `sam deploy`
 └── src/
     ├── app.py               # Lambda handler
-    ├── Makefile             # SAM build hook (bundles ../../trustline.py)
+    ├── trustline.py         # symlink to ../../trustline.py
+    ├── grants.py            # symlink to ../../grants.py
+    ├── Makefile             # SAM build hook (bundles trustline.py + grants.py)
     └── requirements.txt     # boto3/rich/requests/pyyaml pinning for the package
 ```

@@ -1,0 +1,19 @@
+---
+description: This GitHub repo is public. Never publish live AWS leftovers, account IDs, or scan artifacts.
+alwaysApply: true
+---
+
+# Public repo — no live leftovers
+
+`zoph-io/aws-trustline` is **public**. Do not write anything to git, GitHub, or committed docs that would help someone exploit a real account.
+
+**Never publish** (PRs, issues, commit messages, README, tests, comments, canvases that get committed):
+
+- Live AWS account IDs, aliases, profile names, org IDs, or ARNs from a real scan
+- Bucket, role, RAM share, AMI, SSM, OIDC app, or CloudFront OAI/OAC names from a real account
+- Unknown principal IDs, leftover counts, or a table of findings from a live run
+- Contents of `trusted_accounts.yaml`, `reports/`, credentials, or scan HTML/Markdown
+
+**Allowed:** synthetic 12-digit IDs (`111122223333`, `222222222222`, `123456789012`). Well-known public AWS/vendor IDs already in AWS docs or fwd:cloudsec (e.g. Redshift Support). Classification behavior, flags, and coverage lists with placeholders.
+
+**PR / issues:** say “validated on private accounts.” Do not paste leftover tables, profile names, or “unknown is N.” If a live ID slipped into a fixture, replace it before push.
